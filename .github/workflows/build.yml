@@ -1,0 +1,71 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+# Every commit on the default branch gets its own image and verdict, so none is cancelled by a later push.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    # Only the default branch is verified and publishes an image.
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker build --platform linux/amd64 \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --tag "${image}:${GITHUB_SHA}" .
+
+      - name: Set up Node
+        if: hashFiles('package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      # The repository's own tests, when package.json has a test script; skipped otherwise.
+      - name: Test
+        run: |
+          if [ -f package.json ] && node -e 'process.exit(require("./package.json").scripts?.test ? 0 : 1)'; then
+            if [ -f package-lock.json ]; then npm ci; else npm install; fi
+            npm test
+          else
+            echo "No test script in package.json: tests skipped."
+          fi
+
+      - name: Log in to the container registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      # Tagged with the commit only: a deploy names the commit it runs.
+      - name: Push
+        run: |
+          docker push "ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}"
+
+  # The verdict, readable over git alone: refs/ci/pass/<sha> once the image is built, tested and pushed,
+  # refs/ci/fail/<sha> otherwise. Custom refs are not branches or tags, so pushing one starts nothing.
+  verdict:
+    if: ${{ always() && github.event_name == 'push' && github.ref_name == github.event.repository.default_branch }}
+    needs: [image]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Publish the verdict
+        run: |
+          result=pass
+          if [ "${{ needs.image.result }}" != success ]; then result=fail; fi
+          git push origin "HEAD:refs/ci/$result/${{ github.sha }}"
+          echo "$result ${{ github.sha }}"

@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { Store } from "../lib/store.js";
+import { Store, ApiError } from "../lib/store.js";
 import LIMITS from "../lib/limits.js";
 import { execFileSync } from "node:child_process";
 
@@ -307,6 +307,66 @@ test("exports carry pending members; a partial attach round trip loses no identi
   s3.attachMember(restored2, "bob", b3);
   assert.equal(s3.membership(restored2.id, b3.id).role, "member", "a twice-pending member attaches normally");
   assert.equal(restored2.pendingMembers, undefined);
+});
+
+test("a rejected attach to a full workspace preserves the pending member through export and restart", () => {
+  const s1 = freshStore();
+  const a = s1.createUser("alice", "longenough1");
+  const b = s1.createUser("bob", "longenough1");
+  const ws = s1.createWorkspace(a, "Full House");
+  s1.joinWorkspace(ws, b);
+  const exported = s1.buildExport(ws);
+  const bobJoinedAt = exported.members.find((m) => m.handle === "bob").joinedAt;
+
+  // Restore with no attach mapping: bob is a pending identity, exactly as a
+  // recovery would leave him.
+  const dir = s1.dir;
+  const s2 = new Store(dir).init();
+  s2.db = { users: [], sessions: [], workspaces: [], members: [], channels: [], invites: [], payments: [], paymentIntents: [], nextSeq: 1 };
+  s2.saveDb();
+  s2.saveLog([]);
+  const restored = s2.restoreExport(exported);
+  const a2 = s2.createUser("alice", "new password 1");
+  s2.attachMember(restored, "alice", a2); // the owner is verified first
+
+  // Fill the workspace to the free limit while bob is still pending.
+  for (let i = 0; i < LIMITS.FREE_MAX_MEMBERS - 1; i++) {
+    s2.joinWorkspace(restored, s2.createUser(`full${i}`, "longenough1"));
+  }
+  assert.equal(s2.memberCount(restored.id), LIMITS.FREE_MAX_MEMBERS);
+
+  // The attach is rejected — and must NOT consume the pending record.
+  const b2 = s2.createUser("bob", "longenough1");
+  assert.throws(
+    () => s2.attachMember(restored, "bob", b2),
+    (err) => err instanceof ApiError && err.status === 403,
+    "a full workspace rejects the attach"
+  );
+  assert.deepEqual(
+    (restored.pendingMembers || []).map((p) => [p.handle, p.role, p.joinedAt]),
+    [["bob", "member", bobJoinedAt]],
+    "the pending handle, role and original joinedAt survive the rejection in memory"
+  );
+
+  // The record survives a save → export → restart: it must not have been
+  // dropped from persisted state by the failed attach.
+  const after = s2.buildExport(restored);
+  assert.deepEqual(after.pendingMembers, [{ handle: "bob", role: "member", joinedAt: bobJoinedAt }]);
+  const s3 = new Store(dir).init();
+  const ws3 = s3.workspaceBySlug(restored.slug);
+  assert.deepEqual(
+    (ws3.pendingMembers || []).map((p) => [p.handle, p.role, p.joinedAt]),
+    [["bob", "member", bobJoinedAt]],
+    "the pending member survives a restart after the rejected attach"
+  );
+
+  // Once a seat frees up, the same attach succeeds and the record clears.
+  s3.db.members = s3.db.members.filter((m) => !(m.wsId === ws3.id && m.userId !== a2.id));
+  s3.saveDb();
+  const b3 = s3.db.users.find((u) => u.handle === "bob");
+  s3.attachMember(ws3, "bob", b3);
+  assert.equal(s3.membership(ws3.id, b3.id).role, "member");
+  assert.equal(ws3.pendingMembers, undefined, "the pending record is consumed only by a successful attach");
 });
 
 test("prune drops messages of deleted workspaces on restart", () => {

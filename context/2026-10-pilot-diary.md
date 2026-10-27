@@ -69,3 +69,34 @@ made on this branch (tests 63/63, persistence check 29/29):
   confirmations racing one intent settle exactly once.
 
 Prompts sent: none. Exports used: none.
+
+## 2026-10-27 (session 4)
+
+Review round 2 of 5 on post-18 at 6c6cb15 asked for two changes; both are made
+(tests 64/64, persistence check 29/29):
+
+- lib/lock.js: the holder-record lock is replaced by an OS flock(2). A holder
+  process (spawned under the util-linux `flock(1)` utility) holds LOCK_EX on
+  a lock file in the data directory; the kernel arbitrates, so there is no
+  takeover step left that could unlink a replacement holder, and nothing is
+  inferred from /proc, which is local to a PID namespace. Ownership lasts
+  until release() or process death: the holder watches the pipe from its
+  owner and exits on EOF, so a SIGKILLed server releases the lock through the
+  kernel with no stale-file logic at all. The handshake is synchronous (a
+  marker file the holder publishes, a status file the wrapper writes) so
+  server.js keeps its synchronous startup and its tests keep importing it
+  in-process. The lock file's contents are diagnostics only. Tests: stale-file
+  acquisition is immediate, two simultaneous acquirers of an existing stale
+  lock race to exactly one winner, a live holder is refused and untouched,
+  SIGKILL of the owner frees the directory, and — run for real with unshare —
+  two live processes in separate PID namespaces sharing one data directory
+  produce exactly one writer. Dockerfile gains util-linux for flock(1).
+- lib/store.js: attachMember() now performs the capacity check (and the
+  already-a-member case) BEFORE removing the pending record, so a rejected
+  attach to a full workspace no longer consumes the pending identity. Test: a
+  rejected attach preserves the pending handle, role and original joinedAt
+  through export and a restart, and a later attach consumes it exactly once.
+
+Session note: the first rewrite of the lock made acquire() async, which broke
+the tests' in-process `import("../server.js").default` contract and hung the
+suite; reverted to the synchronous handshake above instead of restructure.

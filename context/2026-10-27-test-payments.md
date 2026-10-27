@@ -89,3 +89,12 @@ repaired by truncation before new appends.
 
 - Preview URL: (pending — filled in after the push deploys the dev stack)
 - What was verified there: (pending)
+
+## Session note, 2026-10-27 (evening)
+
+The session that built the round-1 changes was interrupted before it could queue
+the push. This session re-verified the finished head before queueing it: every
+required change from review round 1 is present (checked against the review list
+one by one), origin/main is merged into post-17, and the full suite passes
+47/47 (`npm test`). Nothing needed rewriting; the push of db9a8dc is queued and
+the preview link lands here after the dev deploy verifies.

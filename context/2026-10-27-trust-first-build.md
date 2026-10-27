@@ -101,3 +101,89 @@ write permission for the container user, `/healthz` reporting `durable: true` th
 and the persistence check against the deployed instance. Those are the remaining items
 from the review's last change; they can only be exercised once the platform deploys
 the pushed branch, and they will be recorded here and in the post thread.
+
+## Review round 2 — changes made (2026-10-27)
+
+Commit d8c6811 on post-16. Every point the round-2 review raised is addressed;
+each with its own tests.
+
+- **Mount durability (`server.js` → new `lib/storage.js`)**: the broken
+  `statfsSync(...).dev` comparison is gone (Node's StatFs has no `dev`).
+  `inspectStorage(dataDir)` now compares `fs.statSync(dataDir).dev` against
+  `/`'s device id — a separate mounted filesystem — and rejects the known
+  temporary roots (`/tmp`, `/var/tmp`, `/dev/shm`, `/run`, `os.tmpdir()`) so a
+  separate-but-ephemeral mount never counts as persistent. Verdict:
+  `{ onOwnFilesystem, temp, durable, reason }`; an uninspectable path is
+  "not usable". Production still refuses to start on anything not writable
+  and durable; non-production warns and reports `durable=false`. Tests:
+  injected-stat unit tests for each verdict, plus production-startup child
+  tests — refuse without DATA_DIR, refuse a temp dir, refuse `/dev/shm`,
+  refuse an unwritable directory (chmod 555), and a positive test that starts
+  on a real persistent mount when the machine offers one (here: /data) and
+  must report `durable: true` on `/healthz`.
+- **Exclusive ownership (`lib/lock.js` rewritten)**: the pid-file lock is
+  gone entirely. Ownership is now an OS advisory lock (`flock(2)`) held by the
+  *serving process itself* for its lifetime: a shell wrapper opens the lock
+  file on fd 9, takes the non-blocking exclusive flock and `exec`s the entry
+  point, which inherits the locked descriptor — the kernel drops the lock the
+  moment the owner dies (clean exit, SIGKILL, replaced container), so there is
+  no stale lock, no pid to misread, no takeover to get wrong, and nothing to
+  unlink. A crucial pitfall found and avoided: the `flock FILE COMMAND` form
+  *forks* the command, so killing the flock parent leaves the orphaned child
+  holding the lock — the fd-inheritance form (verified against
+  `/proc/self/fdinfo` and inode matching) makes the direct child the owner.
+  `alreadyHeld` verifies the inherited lock via `fstatSync` dev/ino plus the
+  fdinfo lock line; a READ lock does not count. Tests: concurrent acquisition
+  (exactly one winner), leftover pid-bearing files neither block nor grant
+  (pid-reuse / replacement-container scenario), crashed owner releases the
+  lock immediately, restore refuses a live owner before touching anything.
+  The Dockerfile CMD uses the same wrapper; `OPENSLACK_LOCK_*` env stays
+  per-process so a `docker exec` restore still acquires the lock itself.
+- **Shutdown ordering (`server.js`)**: shutdown no longer releases anything —
+  it ends the SSE streams, stops accepting new requests, and waits (deadline
+  3 s) until every in-flight request has finished before `closeAllConnections`
+  and `process.exit`; the kernel drops the advisory lock only then. A request
+  whose JSON body is still arriving is drained (completed) rather than
+  abandoned. Test: a server under the real wrapper receives a partially
+  delivered mutation, SIGTERM arrives, a concurrent restore is refused with
+  "owned by another live process", the request then completes with 201, the
+  server exits 0, a restarted server acquires the directory and the message is
+  in the history.
+- **Reconnect catch-up (`public/app.js`)**: a contiguous recovery cursor is
+  now separate from live delivery. `ingest` buffers live events (per channel)
+  while a catch-up/recovery is in flight and never advances the cursor;
+  pagination advances only from *fetched* rows, so a live event cannot push
+  the next page's cursor past unseen rows; `lastId` is no longer advanced
+  before the catch-up query. Recovered and buffered messages render in id
+  order with dedupe. Tests: a live event arriving before the reconnect
+  catch-up completes, and a 60-message outage forcing multi-page recovery with
+  a live event buffered across it (jsdom, real server, rate-limit-budgeted
+  across three accounts; catch-up page 50).
+- **Pending memberships (`lib/store.js`)**: pending recovered records are now
+  included in `workspaceMembers` (shown as pending, no access) and in
+  `buildExport`, so a partially recovered workspace round-trips through
+  restore without losing them. `attachMember` validates everything (pending
+  record exists, target account exists, workspace capacity) *before* any
+  mutation, and removes the pending record only once attachment succeeds — a
+  failed attach into a full workspace leaves the record in place across saves
+  and restarts. Tests: partial-attach export/restore round trip (twice over),
+  failed full-workspace attach followed by save and restart, nonexistent-user
+  attach, already-member attach.
+- **`fsyncDir` (`lib/store.js`)**: directory open/fsync failures now
+  propagate — a genuine I/O failure is never acknowledged as success. Only
+  explicitly recognized unsupported-operation codes (EINVAL/ENOTSUP/
+  EOPNOTSUPP/ENOSYS) are tolerated, and only outside production. Failure
+  injection tests: an EIO on the directory fsync makes `saveDb` throw and
+  leaves `db.json` unchanged; the same EINVAL is tolerated outside production
+  and throws in production.
+- **Docs**: `docs/limits.md` restore/membership sections updated to describe
+  the kernel lock, the drain-before-release shutdown and the pending-member
+  recovery rules.
+
+**Result:** `npm test` 45/45 pass (31 s, no hangs), `npm run check`
+29/29 PASS. Deployment verification (dev-stack deploy, preview URL, real
+volume mount and permissions, `durable: true` in deployed `/healthz`,
+reconnect/export/restore/deletion plus an actual platform redeploy with
+synthetic data) still depends on the platform pushing and deploying this
+branch — it happens next session, and the results will be recorded here and
+in the post thread before any real user is invited.

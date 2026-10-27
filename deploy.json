@@ -7,8 +7,10 @@
       "cpus": 1,
       "memory_mb": 512,
       "count": 1,
-      "volume_gb": 0,
-      "env": {},
+      "volume_gb": 1,
+      "env": {
+        "DATA_DIR": "/data"
+      },
       "public": true
     }
   ]

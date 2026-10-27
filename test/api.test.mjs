@@ -5,6 +5,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
+import { spawn, execFileSync } from "node:child_process";
+
+const ROOT_SERVER = path.join(path.dirname(new URL(import.meta.url).pathname), "..");
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-api-"));
 process.env.PORT = "0";
@@ -192,6 +195,119 @@ test("pages and static assets are served", async () => {
   assert.match(await joinPage.text(), /Join a workspace/);
   assert.equal((await fetch(`http://127.0.0.1:${port}/w/UPPER`)).status, 404);
   assert.equal((await call("POST", "/api/nope")).res.status, 404);
+});
+
+test("shutdown holds the data directory until in-flight requests finish", async () => {
+  // A server started exactly as the deployment does: under flock, holding the
+  // exclusive lock for its lifetime. SIGTERM must not hand the directory to a
+  // restore while a mutation request is still being received.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-shutdown-"));
+  const port = 19000 + Math.floor(Math.random() * 500);
+  const lock = await import("../lib/lock.js");
+  const start = (p) => {
+    const cmd = lock.wrapper(dir, process.execPath, [path.join(ROOT_SERVER, "server.js")]);
+    return spawn(cmd.file, cmd.args, {
+      cwd: fs.mkdtempSync(path.join(os.tmpdir(), "openslack-shutdown-cwd-")),
+      env: { ...process.env, PORT: String(p), DATA_DIR: dir, NODE_ENV: "test" },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+  };
+  const child = start(port);
+  let childOut = "";
+  child.stdout.on("data", (d) => (childOut += d));
+  child.stderr.on("data", (d) => (childOut += d));
+  const exited = new Promise((resolve) => child.on("exit", (code) => resolve(code)));
+  try {
+    for (let i = 0; i < 100; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/healthz`);
+        if (res.ok) break;
+      } catch {}
+      if (i === 99) throw new Error(`child server did not start: ${childOut.slice(0, 300)}`);
+    }
+
+    const signup = await fetch(`http://127.0.0.1:${port}/api/signup`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ handle: "drainer", password: "longenough1" })
+    });
+    const cookie = (signup.headers.get("set-cookie") || "").split(";")[0];
+    const ws = await (
+      await fetch(`http://127.0.0.1:${port}/api/workspaces`, {
+        method: "POST",
+        headers: { "content-type": "application/json", cookie },
+        body: JSON.stringify({ name: "Drain" })
+      })
+    ).json();
+
+    // A mutation request whose body is only partly received: the server has
+    // the headers, the message is not yet written.
+    const body = JSON.stringify({ text: "posted during shutdown" });
+    const req = http.request({
+      host: "127.0.0.1",
+      port,
+      path: `/api/ws/${ws.slug}/channels/general/messages`,
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, "content-length": String(body.length) }
+    });
+    req.write(body.slice(0, 5));
+    await new Promise((r) => setTimeout(r, 300)); // let the server take the request in
+
+    child.kill("SIGTERM"); // graceful shutdown: it must wait for this request
+    await new Promise((r) => setTimeout(r, 300));
+
+    // While the request is still open, the directory is still owned.
+    let refused = null;
+    try {
+      execFileSync(process.execPath, [path.join(ROOT_SERVER, "scripts", "restore.js"), path.join(os.tmpdir(), `no-such-export-${process.pid}.json`)], {
+        env: { ...process.env, DATA_DIR: dir },
+        encoding: "utf8",
+        timeout: 10000
+      });
+    } catch (err) {
+      refused = err;
+    }
+    assert.ok(refused, "restore must be refused while the server drains");
+    assert.match(String(refused.stderr), /owned by another live process/, String(refused.stderr).slice(0, 200));
+
+    // Finish the request: the server completes it, then exits, then the
+    // directory is free.
+    const res = await new Promise((resolve, reject) => {
+      req.on("response", resolve);
+      req.on("error", reject);
+      req.end(body.slice(5));
+    });
+    assert.equal(res.statusCode, 201, "the in-flight mutation completes during the drain");
+    res.resume();
+    assert.equal(await exited, 0, "the server exits once nothing can write");
+
+    // The directory is free again, and the message made it to disk.
+    const again = start(port + 1);
+    let restarted = false;
+    for (let i = 0; i < 100 && !restarted; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      try {
+        const res2 = await fetch(`http://127.0.0.1:${port + 1}/healthz`);
+        if (res2.ok) restarted = true;
+      } catch {}
+    }
+    assert.ok(restarted, "a new server acquires the freed directory");
+    const login = await fetch(`http://127.0.0.1:${port + 1}/api/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ handle: "drainer", password: "longenough1" })
+    });
+    const cookie2 = (login.headers.get("set-cookie") || "").split(";")[0];
+    const history = await (
+      await fetch(`http://127.0.0.1:${port + 1}/api/ws/${ws.slug}/channels/general/messages`, { headers: { cookie: cookie2 } })
+    ).json();
+    assert.ok((history.messages || []).some((m) => m.text === "posted during shutdown"), "the drained mutation persisted");
+    again.kill("SIGTERM");
+  } finally {
+    child.kill("SIGKILL");
+    await Promise.race([exited, new Promise((r) => setTimeout(r, 1000))]);
+  }
 });
 
 test("server shuts down cleanly", async () => {

@@ -121,7 +121,7 @@ async function until(fn, what, ms = 2000) {
 
 const submit = (page, form) => form.dispatchEvent(new page.window.Event("submit", { bubbles: true, cancelable: true }));
 
-let ownerCookie, guestCookie, slug, inviteToken;
+let ownerCookie, guestCookie, visitorCookie, slug, inviteToken;
 
 test("seed: owner signs up, creates a workspace, invites a guest", async () => {
   ownerCookie = cookieOf((await call("POST", "/api/signup", { handle: "owner", password: "longenough1" })).res);
@@ -175,6 +175,7 @@ test("an unauthenticated invitee is sent to sign up, and signing up completes th
   // The join really happened server-side: the visitor is a member now.
   const me = await call("GET", "/api/me", null, home.cookie());
   assert.ok(me.body.workspaces.some((w) => w.slug === slug), "the visitor joined the invited workspace");
+  visitorCookie = home.cookie();
 });
 
 test("an invalid invitation is cleared, never retried forever", async () => {
@@ -232,6 +233,40 @@ test("initial history renders, and reconnect catch-up recovers messages posted d
   );
   await new Promise((r) => setTimeout(r, 100));
   assert.ok(![...doc.querySelector("#log").children].some((n) => n.textContent.includes("not for you")), "no cross-channel leakage");
+
+  // Multi-page recovery with a live event in flight. The catch-up page is 50
+  // rows, so 60 missed messages force more than one fetch; and a live event
+  // that arrives while the catch-up is still running must wait for the gap
+  // to be filled — never jump it or push the cursor past unseen rows.
+  es.close(); // the outage: nothing is delivered while these are posted
+  const bulk = [];
+  for (let i = 0; i < 20; i++) {
+    for (const [ck, who] of [[ownerCookie, "owner"], [guestCookie, "guest"], [visitorCookie, "visitor"]]) {
+      const r = await call("POST", `/api/ws/${slug}/channels/general/messages`, { text: `bulk ${who} ${i}` }, ck);
+      bulk.push(r.body.message);
+    }
+  }
+  assert.equal(bulk.length, 60, "all bulk posts accepted (rate limit allows 3 users x 20)");
+  assert.equal([...doc.querySelector("#log").children].filter((n) => n.textContent.includes("bulk")).length, 0, "nothing delivered while offline");
+
+  const origFetch = page.window.fetch;
+  let catchUpFetches = 0;
+  page.window.fetch = (p, o) => {
+    if (typeof p === "string" && p.includes("after=")) catchUpFetches++;
+    return origFetch(p, o);
+  };
+  const last = bulk[bulk.length - 1];
+  es.open(); // reconnect: the catch-up starts and live delivery is held back
+  es.emit("message", JSON.stringify({ type: "message", id: last.id, channel: "general", handle: last.handle, text: last.text, at: last.at }));
+  await until(
+    () => [...doc.querySelector("#log").children].filter((n) => n.textContent.includes("bulk")).length === 60,
+    "multi-page catch-up with a live event buffered"
+  );
+  assert.ok(catchUpFetches >= 2, `catch-up paginated past one page (${catchUpFetches} fetches)`);
+  const ids3 = [...doc.querySelector("#log").children].map((n) => n.dataset.id);
+  assert.deepEqual([...ids3].sort((a, b) => a - b), ids3, "recovered and buffered messages render in id order");
+  assert.equal(new Set(ids3).size, ids3.length, "no duplicates across pages and buffered live events");
+  page.window.fetch = origFetch;
   page.window.close();
 });
 

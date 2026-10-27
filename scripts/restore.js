@@ -4,7 +4,10 @@
 //
 // Administrator tool. It takes exclusive ownership of the data directory and
 // refuses to run while the server holds it: the server would overwrite the
-// restored workspace from its stale in-memory state on its next save.
+// restored workspace from its stale in-memory state on its next save. The
+// exclusivity is an OS-backed flock(2) held by this process for its whole
+// lifetime — the kernel grants it to exactly one process and drops it the
+// moment that process dies, so there is no stale lock and no pid to misread.
 //
 // Access is never granted by handle alone — a handle is a public identifier,
 // not proof of identity. Exported members without an --attach mapping are
@@ -21,7 +24,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { Store, ApiError } = require("../lib/store");
-const { acquire, LockError } = require("../lib/lock");
+const lock = require("../lib/lock");
 
 function resolveDataDir() {
   const wanted = process.env.DATA_DIR;
@@ -51,18 +54,10 @@ for (let i = 0; i < argv.length; i++) {
   }
 }
 
-let dirLock;
-try {
-  dirLock = acquire(resolveDataDir(), "restore");
-} catch (err) {
-  console.error(err instanceof LockError ? err.message : err);
-  console.error("restore refuses to touch a data directory that a running server owns:");
-  console.error("the server would overwrite the restored workspace on its next save. Stop the server first.");
-  process.exit(1);
-}
+const dataDir = resolveDataDir();
 
-try {
-  const store = new Store(resolveDataDir()).init();
+function main() {
+  const store = new Store(dataDir).init();
   const exported = JSON.parse(fs.readFileSync(file, "utf8"));
 
   // Resolve the administrator's mapping against the accounts in this store.
@@ -98,10 +93,29 @@ try {
     console.log("members kept as pending (no access until attached with --attach):");
     for (const p of pending) console.log(`  @${p.handle} (${p.role})`);
   }
-} catch (err) {
-  if (err instanceof ApiError) console.error(err.message);
-  else console.error(err);
-  process.exitCode = 1;
-} finally {
-  dirLock.release();
+}
+
+if (lock.alreadyHeld(dataDir)) {
+  // Re-entered as the flock'd child: hold the lock for the whole run. The
+  // kernel releases it when this process exits, so nothing releases it early.
+  lock.watchSupervisor();
+  try {
+    main();
+  } catch (err) {
+    if (err instanceof ApiError) console.error(err.message);
+    else console.error(err);
+    process.exitCode = 1;
+  }
+} else {
+  // Started bare: re-run under flock and supervise. If the lock is taken the
+  // probe inside runUnderLock throws before anything is touched.
+  try {
+    lock.runUnderLock(dataDir, "restore");
+  } catch (err) {
+    console.error(err instanceof lock.LockError ? err.message : err);
+    console.error("restore refuses to touch a data directory that a running server owns:");
+    console.error("the server would overwrite the restored workspace on its next save. Stop the server first.");
+    process.exit(1);
+  }
+  // The supervisor waits for the flock'd child and exits with its code.
 }

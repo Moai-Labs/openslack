@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { Store } from "../lib/store.js";
+import { Store, fsyncDir } from "../lib/store.js";
 import LIMITS from "../lib/limits.js";
 import { execFileSync } from "node:child_process";
 
@@ -219,7 +219,9 @@ test("export and restore round-trip; deletion removes everything", () => {
   const a2 = s2.createUser("alice", "new password 1");
   const b2 = s2.createUser("bob", "new password 1");
   const ws2 = s2.restoreExport(exported);
-  assert.equal(s2.workspaceMembers(ws2.id).length, 0, "no member is attached by handle alone");
+  const listed = s2.workspaceMembers(ws2.id);
+  assert.equal(listed.filter((m) => !m.pending).length, 0, "no member is attached by handle alone");
+  assert.deepEqual(listed.filter((m) => m.pending).map((p) => [p.handle, p.role]), [["alice", "owner"], ["bob", "member"]], "pending records are listed as members-to-be, with no access");
   assert.deepEqual((ws2.pendingMembers || []).map((p) => [p.handle, p.role]), [["alice", "owner"], ["bob", "member"]], "membership records are preserved pending");
   assert.equal(s2.membership(ws2.id, a2.id), null, "an existing account with a matching handle has no access");
   assert.equal(ws2.ownerId, null);
@@ -290,4 +292,127 @@ test("the persistence check refuses a non-empty data directory and never touches
   assert.equal(fs.readFileSync(path.join(dir, "db.json"), "utf8"), sentinel, "db.json untouched");
   assert.equal(fs.readFileSync(path.join(dir, "messages.jsonl"), "utf8"), sentinel, "messages.jsonl untouched");
   assert.equal(fs.readdirSync(dir).sort().join(","), before, "nothing added or removed");
+});
+
+test("a directory fsync failure is never acknowledged as durability", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-fsync-"));
+  const s = new Store(dir).init();
+  const a = s.createUser("alice", "longenough1");
+  const ws = s.createWorkspace(a, "Fsync");
+  const before = JSON.stringify(JSON.parse(fs.readFileSync(s.dbPath, "utf8")));
+  const origOpen = fs.openSync;
+  const envBefore = process.env.NODE_ENV;
+
+  // fsyncDir opens the directory read-only; make exactly that open fail with
+  // a genuine I/O error.
+  fs.openSync = (p, flags, ...rest) => {
+    if (p === dir && flags === "r") throw Object.assign(new Error("injected EIO"), { code: "EIO" });
+    return origOpen(p, flags, ...rest);
+  };
+  try {
+    assert.throws(() => s.saveDb(), /could not (open|fsync) the data directory/, "the replacement is refused, not acknowledged");
+    assert.equal(JSON.stringify(JSON.parse(fs.readFileSync(s.dbPath, "utf8"))), before, "the old db.json is still in place");
+
+    // Platforms that refuse directory fsyncs outright: tolerated outside
+    // production only, never in production.
+    process.env.NODE_ENV = "test";
+    fs.openSync = (p, flags, ...rest) => {
+      if (p === dir && flags === "r") throw Object.assign(new Error("unsupported"), { code: "EINVAL" });
+      return origOpen(p, flags, ...rest);
+    };
+    assert.doesNotThrow(() => fsyncDir(dir), "a recognized unsupported-operation error stays tolerated outside production");
+    process.env.NODE_ENV = "production";
+    assert.throws(() => fsyncDir(dir), /could not open the data directory/, "production never accepts an unsynced directory entry");
+  } finally {
+    fs.openSync = origOpen;
+    process.env.NODE_ENV = envBefore;
+  }
+});
+
+test("pending memberships survive a partial attachment and an export/restore round trip", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-pending-"));
+  const s1 = new Store(dir).init();
+  const a = s1.createUser("alice", "longenough1");
+  const b = s1.createUser("bob", "longenough1");
+  const c = s1.createUser("carol", "longenough1");
+  const ws = s1.createWorkspace(a, "Pending");
+  s1.joinWorkspace(ws, b);
+  s1.joinWorkspace(ws, c);
+  s1.postMessage(ws, s1.channelByName(ws.id, "general"), a, "hi");
+  const exported = s1.buildExport(ws);
+
+  // Restore with only the owner verified: bob and carol stay pending.
+  const s2 = new Store(fs.mkdtempSync(path.join(os.tmpdir(), "openslack-pending-"))).init();
+  const a2 = s2.createUser("alice", "another password");
+  const ws2 = s2.restoreExport(exported, { attach: [{ exportHandle: "alice", userId: a2.id }] });
+  assert.equal(s2.membership(ws2.id, a2.id).role, "owner");
+  assert.deepEqual((ws2.pendingMembers || []).map((p) => p.handle).sort(), ["bob", "carol"]);
+
+  // A re-export of the partially recovered workspace must carry the pending
+  // records — otherwise a later restore would lose them for good.
+  const reexport = s2.buildExport(ws2);
+  assert.ok(reexport.members.some((m) => m.handle === "bob" && m.pending), "pending records are part of the export");
+  const s3 = new Store(fs.mkdtempSync(path.join(os.tmpdir(), "openslack-pending-"))).init();
+  const ws3 = s3.restoreExport(reexport);
+  // A handle alone never grants access: in this restore no one is verified,
+  // so even alice — attached in the previous store — waits pending again.
+  assert.deepEqual((ws3.pendingMembers || []).map((p) => p.handle).sort(), ["alice", "bob", "carol"], "the round trip preserves every unattached member");
+  assert.deepEqual(
+    s3.workspaceMembers(ws3.id).filter((m) => !m.pending).map((m) => m.handle),
+    [],
+    "nobody holds access from the export alone"
+  );
+  // and a verified attach on the round-tripped store still works
+  const a3 = s3.createUser("alice", "third password");
+  s3.attachMember(ws3, "alice", a3);
+  assert.equal(s3.membership(ws3.id, a3.id).role, "owner", "the first attach makes the owner");
+  assert.deepEqual((s3.workspaceBySlug(ws3.slug).pendingMembers || []).map((p) => p.handle).sort(), ["bob", "carol"]);
+});
+
+test("a failed attachment keeps the pending record, across saves and restarts", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-attachfail-"));
+  const s1 = new Store(dir).init();
+  const a = s1.createUser("alice", "longenough1");
+  const b = s1.createUser("bob", "longenough1");
+  const ws = s1.createWorkspace(a, "Full");
+  s1.joinWorkspace(ws, b);
+  s1.postMessage(ws, s1.channelByName(ws.id, "general"), a, "one");
+  const exported = s1.buildExport(ws);
+
+  const s2 = new Store(dir).init();
+  s2.db.users = [];
+  s2.db.members = [];
+  s2.db.sessions = [];
+  s2.saveDb();
+  s2.saveLog([]);
+  const ws2 = s2.restoreExport(exported);
+  assert.equal((ws2.pendingMembers || []).length, 2);
+
+  // Fill the workspace to the free-tier cap, then try to attach a verified
+  // account that would exceed it.
+  const extra = [];
+  for (let i = 0; i < LIMITS.FREE_MAX_MEMBERS; i++) {
+    const u = s2.createUser(`member${i}`, "longenough1");
+    s2.joinWorkspace(ws2, u);
+    extra.push(u);
+  }
+  const stranger = s2.createUser("latecomer", "longenough1");
+  assert.throws(() => s2.attachMember(ws2, "alice", stranger), /workspace is full/, "capacity is checked before anything happens");
+  assert.ok((ws2.pendingMembers || []).some((p) => p.handle === "alice"), "the pending record was not dropped by the failed attempt");
+
+  // A later save (any other operation) and a restart must not persist the
+  // removal that never should have happened.
+  s2.saveDb();
+  const s3 = new Store(dir).init();
+  const ws3 = s3.workspaceBySlug(ws2.slug);
+  assert.deepEqual((ws3.pendingMembers || []).map((p) => p.handle).sort(), ["alice", "bob"], "pending membership survives the failed attach, a save and a restart");
+
+  // Attaching an account that does not exist is refused the same way.
+  assert.throws(() => s3.attachMember(ws3, "alice", { id: "no-such-user" }), /does not exist/);
+  assert.ok((s3.workspaceBySlug(ws2.slug).pendingMembers || []).some((p) => p.handle === "alice"));
+
+  // A member already attached stays attached when their record is consumed.
+  s3.attachMember(ws3, "alice", extra[0]);
+  assert.equal(s3.membership(ws3.id, extra[0].id).role, "member", "the workspace already has an owner, so the role stays member");
+  assert.deepEqual((s3.workspaceBySlug(ws2.slug).pendingMembers || []).map((p) => p.handle), ["bob"]);
 });

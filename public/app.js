@@ -157,9 +157,17 @@ function initJoin() {
 function initChat() {
   const slug = document.querySelector("#chat").dataset.slug;
   let current = "general";
-  let lastId = 0; // last message id shown for the current channel
+  // The recovery cursor: the highest message id fully accounted for the
+  // current channel. It advances only when a message is rendered (live
+  // delivery is id-ordered per workspace, so receiving id N means nothing
+  // lower is still coming) or when a fetched history page advances it — never
+  // from a live event that arrived while a catch-up was still filling the gap.
+  let cursor = 0;
   let historyGen = 0; // bumped on every switch; stale history responses are dropped
   let channelReady = false; // the current channel's initial history has rendered
+  let recovering = null; // { channel, gen } while a reconnect catch-up is in flight
+  let pendingLive = []; // live events held while recovery (or the initial fill) is in flight
+  let pendingInitial = []; // events that arrived before the first history rendered
   let role = "member";
 
   const conn = $("#conn");
@@ -178,12 +186,31 @@ function initChat() {
   };
 
   const log = $("#log");
-  const append = (m, channel) => {
-    if (channel !== current) return;
-    lastId = Math.max(lastId, Number(m.id)); // even for duplicates: the id is now covered
-    if (log.querySelector(`[data-id="${m.id}"]`)) return;
+  const renderRow = (m) => {
+    if (log.querySelector(`[data-id="${m.id}"]`)) return false; // duplicate
     log.append(msgNode(m));
     log.scrollTop = log.scrollHeight;
+    return true;
+  };
+
+  // A live event with a fully-recovered past: render it and advance the
+  // cursor. Events that arrive before their channel's history exists are
+  // held and flushed after the history, so the log stays in id order.
+  const accept = (m) => {
+    const id = Number(m.id);
+    if (id > cursor) cursor = id;
+    if (channelReady) renderRow(m);
+    else pendingInitial.push(m);
+  };
+
+  // Live delivery. While a catch-up is in flight nothing is rendered and the
+  // cursor does not move: events wait in pendingLive, and after the catch-up
+  // they are drained in id order (the stream delivers per-workspace events
+  // in id order, so sorting the buffer restores the true order).
+  const ingest = (m) => {
+    if (m.channel !== current) return;
+    if (recovering) pendingLive.push(m);
+    else accept(m);
   };
 
   async function fetchHistory(channel, after, limit) {
@@ -199,29 +226,53 @@ function initChat() {
     channelReady = false;
     const data = await fetchHistory(channel, null, 100);
     if (gen !== historyGen) return; // the user switched channels meanwhile
-    for (const m of data.messages) append(m, channel);
+    for (const m of data.messages || []) {
+      if (Number(m.id) > cursor) cursor = Number(m.id);
+      renderRow(m);
+    }
     channelReady = true;
+    for (const m of pendingInitial.splice(0)) renderRow(m); // held live events, now in place
     log.scrollTop = log.scrollHeight;
   }
 
   // Catch up on everything missed while the stream was down, oldest first,
-  // paginating until the server has nothing past the last displayed id.
+  // paginating from the recovery cursor until the server has nothing more.
+  // Each fetched page advances the cursor itself; live events arriving during
+  // the catch-up never do.
   async function catchUp(channel) {
-    if (!channelReady) return; // the initial load has not set lastId yet
-    const gen = ++historyGen;
-    for (;;) {
-      const data = await fetchHistory(channel, lastId, 200);
-      if (gen !== historyGen || channel !== current) return;
-      const missed = data.messages || [];
-      for (const m of missed) append(m, channel);
-      if (missed.length < 200) return;
+    if (!channelReady || channel !== current || recovering) return;
+    const gen = historyGen;
+    recovering = { channel, gen };
+    try {
+      for (;;) {
+        const data = await fetchHistory(channel, cursor, 50);
+        if (gen !== historyGen || channel !== current) return;
+        const missed = data.messages || [];
+        for (const m of missed) {
+          const id = Number(m.id);
+          if (id > cursor) {
+            cursor = id; // the fetched page advances the pagination cursor
+            renderRow(m);
+          }
+        }
+        if (missed.length < 50) break;
+      }
+    } finally {
+      if (recovering && recovering.channel === channel && recovering.gen === gen && channel === current && gen === historyGen) {
+        recovering = null;
+        const held = pendingLive.splice(0).sort((a, b) => Number(a.id) - Number(b.id));
+        for (const m of held) accept(m);
+      }
     }
   }
 
   async function switchChannel(name) {
     historyGen++; // anything in flight for the old channel is now stale
+    recovering = null;
     current = name;
-    lastId = 0;
+    cursor = 0;
+    pendingLive = [];
+    pendingInitial = [];
     log.textContent = "";
     $("#ch-name").textContent = "#" + name;
     document.querySelectorAll("#channels button").forEach((b) => b.classList.toggle("active", b.textContent === "#" + name));
@@ -233,10 +284,8 @@ function initChat() {
     const es = new EventSource(`/api/ws/${slug}/stream`);
     es.addEventListener("message", (e) => {
       const m = JSON.parse(e.data);
-      if (m.type !== "message" || m.channel !== current) return;
-      const gap = Number(m.id) > lastId + 1; // something was missed mid-stream
-      append(m, m.channel);
-      if (gap) catchUp(current).catch(() => {});
+      if (m.type !== "message") return;
+      ingest(m);
     });
     es.onopen = () => {
       conn.textContent = "live"; conn.classList.add("live");
@@ -300,7 +349,9 @@ function initChat() {
     $("#member-count").textContent = `${info.members.length}/${info.maxMembers}`;
     const ul = $("#members");
     ul.textContent = "";
-    for (const mem of info.members) ul.append(el("li", null, `@${mem.handle} (${mem.role})`));
+    for (const mem of info.members) {
+      ul.append(el("li", null, `@${mem.handle} (${mem.role}${mem.pending ? ", awaiting recovery" : ""})`));
+    }
     const chans = await api(`/api/ws/${slug}/channels`);
     const list = $("#channels");
     list.textContent = "";

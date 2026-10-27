@@ -7,7 +7,10 @@ COPY public ./public
 COPY scripts ./scripts
 ENV NODE_ENV=production PORT=3000
 EXPOSE 3000
+# The volume mounts at /data (deploy.json): make sure the directory exists and
+# is writable by the node user even before a volume is attached. The server
+# refuses to start in production unless that path is a separate mount it can
+# write to, so an unmounted or unwritable volume fails the deploy loudly.
+RUN mkdir -p /data && chown node:node /data
 USER node
-# DATA_DIR points at the mounted volume in deploy.json; without it the server
-# falls back to local storage and /healthz reports durable=false.
 CMD ["node", "server.js"]

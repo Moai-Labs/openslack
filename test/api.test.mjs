@@ -8,6 +8,7 @@ import http from "node:http";
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-api-"));
 process.env.PORT = "0";
+process.env.NODE_ENV = "test"; // the production storage gate is exercised by the deployment, not here
 const server = (await import("../server.js")).default;
 
 async function onceReady(port) {
@@ -39,11 +40,12 @@ async function call(method, p, body, cookie) {
   return { res, ...(await j(res)) };
 }
 
-test("healthz reports storage", async () => {
+test("healthz reports storage and its verified durability", async () => {
   const { res, body } = await call("GET", "/healthz");
   assert.equal(res.status, 200);
   assert.equal(body.ok, true);
   assert.ok(body.storage.dataDir);
+  assert.equal(typeof body.durable, "boolean");
 });
 
 test("signup, login, me", async () => {
@@ -169,12 +171,14 @@ test("export, delete, restore path over the API", async () => {
   assert.equal((await call("DELETE", `/api/ws/${slug}`, null, a)).res.status, 200);
   assert.equal((await call("GET", `/api/ws/${slug}`, null, a)).res.status, 404);
 
-  // restore via the store API, same handles still present
+  // restore via the store API with the administrator's verified mapping
   const { Store } = await import("../lib/store.js");
   const store = new Store(process.env.DATA_DIR).init();
-  const ws2 = store.restoreExport(exp);
+  const ownerId = store.db.users.find((u) => u.handle === "owner").id;
+  const ws2 = store.restoreExport(exp, { attach: [{ exportHandle: "owner", userId: ownerId }] });
   assert.equal(store.history(ws2.id, store.channelByName(ws2.id, "random").id, { limit: 1 })[0].text, "live one");
-  assert.equal(store.membership(ws2.id, store.db.users.find((u) => u.handle === "owner").id).role, "owner");
+  assert.equal(store.membership(ws2.id, ownerId).role, "owner");
+  assert.equal((ws2.pendingMembers || []).map((p) => p.handle).sort().join(","), "guest,member0,member1,member2", "unattached exported members stay pending");
 });
 
 test("pages and static assets are served", async () => {

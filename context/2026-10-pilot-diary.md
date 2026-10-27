@@ -39,3 +39,33 @@ The lane was re-taken after the review-failure pause. What was done:
   link, no invitation sent yet. Recruitment starts the day a link exists.
 
 Prompts sent: none. Exports used: none (the smoke export is synthetic).
+
+## 2026-10-27 (session 3)
+
+Review round 1 of 5 on post-18 at 3a16199 asked for five changes; all five are
+made on this branch (tests 63/63, persistence check 29/29):
+
+- public/app.js: the SSE gap handler no longer appends the gap event before
+  recovery — coverage is a separate cursor (lastId), out-of-order events wait
+  in an ordered buffer and flush contiguously, and the recovery loop paginates
+  from the last fully covered cursor. Browser tests added: missed batch + live
+  tail, live events during a two-page recovery, and a 200+ backlog caught up
+  while search results are on screen (fetch count bounded, channel resumes).
+- lib/lock.js: pid-file lock replaced by a hardlink-published holder record —
+  contents complete before the name exists (no initializing lock to steal, and
+  an unreadable lock is refused, never deleted). Holder identity is boot id +
+  /proc starttime, so a container restart that reuses pid 1 is detected as a
+  NEW instance and the stale lock is taken over. Release removes only its own
+  token. Tests: pid-reuse takeover, live-instance refusal, simultaneous
+  acquisition (exactly one winner), foreign-lock safety.
+- lib/store.js: buildExport() now carries pendingMembers (handle, role,
+  original joinedAt, no access); restoreExport() preserves exported pending
+  records. Round-trip test: restore → partial attach → export → restore keeps
+  every identity.
+- lib/store.js: completeTestPayment() revalidates after the network await —
+  workspace still exists, caller still owner, same intent still pending and
+  unexpired — and settles synchronously (atomic on the single-threaded
+  store). Tests: deletion mid-verification leaves nothing behind; two
+  confirmations racing one intent settle exactly once.
+
+Prompts sent: none. Exports used: none.

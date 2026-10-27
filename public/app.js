@@ -157,9 +157,15 @@ function initJoin() {
 function initChat() {
   const slug = document.querySelector("#chat").dataset.slug;
   let current = "general";
-  let lastId = 0; // last message id shown for the current channel
-  let historyGen = 0; // bumped on every switch; stale history responses are dropped
+  // The coverage cursor: every message with an id <= lastId has been rendered
+  // or is otherwise accounted for. It is separate from any single live event —
+  // a live event that jumps a gap must never drag the cursor past the missed
+  // messages, or recovery would start beyond them and lose them for good.
+  let lastId = 0;
+  let historyGen = 0; // bumped on every switch; stale history and recovery responses are dropped
   let channelReady = false; // the current channel's initial history has rendered
+  let filling = false; // a recovery fetch loop is running
+  const waiting = new Map(); // id -> message: arrived ahead of the coverage cursor
   let role = "member";
   let tier = "free";
   let maxMembers = 0;
@@ -181,14 +187,40 @@ function initChat() {
 
   const log = $("#log");
   // While a workspace search is on screen the log holds search results, not
-  // the channel, so live messages must not land in it.
+  // the channel, so live messages must not land in it. Coverage still
+  // advances while searching (see deliver), and going back to the channel
+  // re-renders its history from the server, so nothing shown there is lost.
   let searchView = false;
-  const append = (m, channel) => {
+
+  // Rendering only: never moves the coverage cursor.
+  const render = (m, channel) => {
     if (searchView || channel !== current) return;
-    lastId = Math.max(lastId, Number(m.id)); // even for duplicates: the id is now covered
     if (log.querySelector(`[data-id="${m.id}"]`)) return;
     log.append(msgNode(m));
     log.scrollTop = log.scrollHeight;
+  };
+
+  // Account for one message, live or recovered. Anything ahead of the cursor
+  // waits until everything before it is covered, so events merge into message
+  // order no matter when they arrived. Returns true when messages are still
+  // waiting past a hole in the covered range — the server must be asked for it.
+  const deliver = (m, channel) => {
+    if (channel !== current) return false;
+    const id = Number(m.id);
+    if (!Number.isFinite(id) || id <= lastId) return waiting.size > 0; // already covered
+    waiting.set(id, m);
+    return flushWaiting(channel);
+  };
+
+  const flushWaiting = (channel) => {
+    for (;;) {
+      const next = waiting.get(lastId + 1);
+      if (!next) break;
+      waiting.delete(lastId + 1);
+      render(next, channel);
+      lastId = lastId + 1;
+    }
+    return waiting.size > 0;
   };
 
   // Search results read with their channel: a hit from another channel means
@@ -274,22 +306,50 @@ function initChat() {
     channelReady = false;
     const data = await fetchHistory(channel, null, 100);
     if (gen !== historyGen) return; // the user switched channels meanwhile
-    for (const m of data.messages) append(m, channel);
+    let top = 0;
+    for (const m of data.messages) {
+      render(m, channel);
+      const n = Number(m.id);
+      if (Number.isFinite(n) && n > top) top = n;
+    }
+    // Events that queued while the initial page was in flight are covered by
+    // it up to its newest id; anything beyond that waits for recovery.
+    for (const id of waiting.keys()) if (id <= top) waiting.delete(id);
+    lastId = top;
     channelReady = true;
     log.scrollTop = log.scrollHeight;
+    if (waiting.size) fill(channel).catch(() => {});
   }
 
-  // Catch up on everything missed while the stream was down, oldest first,
-  // paginating until the server has nothing past the last displayed id.
-  async function catchUp(channel) {
-    if (!channelReady) return; // the initial load has not set lastId yet
-    const gen = ++historyGen;
-    for (;;) {
-      const data = await fetchHistory(channel, lastId, 200);
-      if (gen !== historyGen || channel !== current) return;
-      const missed = data.messages || [];
-      for (const m of missed) append(m, channel);
-      if (missed.length < 200) return;
+  // Recover everything the covered cursor has not seen: on (re)connect for
+  // whatever the stream missed while it was down, or on demand when a live
+  // event jumped a gap. Oldest first, paginating until the server has nothing
+  // more and nothing is waiting out of order. The cursor only ever moves
+  // through flushWaiting — a fetched page can never be marked covered without
+  // its predecessors being accounted for too.
+  async function fill(channel) {
+    if (filling || !channelReady) return;
+    filling = true;
+    try {
+      const gen = historyGen;
+      for (;;) {
+        if (gen !== historyGen || channel !== current) return;
+        const data = await fetchHistory(channel, lastId, 200);
+        if (gen !== historyGen || channel !== current) return;
+        const rows = data.messages || [];
+        const before = lastId;
+        for (const m of rows) deliver(m, channel);
+        if (rows.length < 200 && !waiting.size) return; // fully caught up
+        if (lastId === before && waiting.size) {
+          // No progress while the server holds nothing between the cursor and
+          // the waiting ids: that stretch no longer exists (pruned history).
+          // Re-anchor past the unfillable hole rather than stall forever.
+          lastId = Math.min(...waiting.keys()) - 1;
+          flushWaiting(channel);
+        }
+      }
+    } finally {
+      filling = false;
     }
   }
 
@@ -297,6 +357,8 @@ function initChat() {
     historyGen++; // anything in flight for the old channel is now stale
     current = name;
     lastId = 0;
+    waiting.clear();
+    channelReady = false;
     log.textContent = "";
     exitSearch();
     $("#ch-name").textContent = "#" + name;
@@ -308,15 +370,15 @@ function initChat() {
     conn.textContent = "connecting…"; conn.classList.remove("live");
     const es = new EventSource(`/api/ws/${slug}/stream`);
     es.addEventListener("message", (e) => {
-      const m = JSON.parse(e.data);
-      if (m.type !== "message" || m.channel !== current) return;
-      const gap = Number(m.id) > lastId + 1; // something was missed mid-stream
-      append(m, m.channel);
-      if (gap) catchUp(current).catch(() => {});
+      let m;
+      try { m = JSON.parse(e.data); } catch { return; } // a malformed frame is dropped, not fatal
+      if (m.type !== "message") return;
+      deliver(m, m.channel);
+      if (waiting.size) fill(current).catch(() => {}); // a gap opened: ask the server to fill it
     });
     es.onopen = () => {
       conn.textContent = "live"; conn.classList.add("live");
-      catchUp(current).catch(() => {}); // recover anything missed while away
+      fill(current).catch(() => {}); // recover anything missed while the stream was down
     };
     es.onerror = () => {
       conn.textContent = "reconnecting…"; conn.classList.remove("live");

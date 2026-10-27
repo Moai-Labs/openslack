@@ -458,6 +458,152 @@ test("history renders again after a reload and when switching channels", async (
   page.window.close();
 });
 
+// ---- recovery: gaps, paginated backlogs, and search during catch-up ----
+//
+// A workspace paid for through the labelled test path, so enough members can
+// join to post a backlog of more than one recovery page (200) within the
+// per-minute rate limit.
+let recSlug, recOwnerCookie;
+const recPosters = [];
+
+test("seed: a paid workspace with enough posters to outrun the rate limit", async () => {
+  recOwnerCookie = cookieOf((await call("POST", "/api/signup", { handle: "recowner", password: "longenough1" })).res);
+  const ws = await call("POST", "/api/workspaces", { name: "Recovery Test" }, recOwnerCookie);
+  recSlug = ws.body.slug;
+  receipts.set(TX(90), receiptFor(TX(90)));
+  const start = await call("POST", `/api/ws/${recSlug}/pay-test/start`, null, recOwnerCookie);
+  const confirm = await call("POST", `/api/ws/${recSlug}/pay-test/confirm`, { intentId: start.body.intentId, txHash: TX(90) }, recOwnerCookie);
+  assert.equal(confirm.res.status, 200, "the workspace is on the paid tier so 25 members can join");
+  const inv = await call("POST", "/api/invites", { slug: recSlug }, recOwnerCookie);
+  for (let i = 0; i < 15; i++) {
+    const c = cookieOf((await call("POST", "/api/signup", { handle: `rec${i}`, password: "longenough1" })).res);
+    await call("POST", `/api/invites/${inv.body.token}/join`, null, c);
+    recPosters.push(c);
+  }
+  for (let i = 0; i < 2; i++) await postBacklog(1, "baseline");
+});
+
+// Posts n messages spread across the member posters; returns the message ids.
+async function postBacklog(n, text) {
+  const ids = [];
+  for (let i = 0; i < n; i++) {
+    const cookie = recPosters[i % recPosters.length];
+    const r = await call("POST", `/api/ws/${recSlug}/channels/general/messages`, { text: `${text} ${i}` }, cookie);
+    assert.equal(r.res.status, 201, "every backlog message lands");
+    ids.push(r.body.message.id);
+  }
+  return ids;
+}
+
+test("a live event that jumps a gap recovers the missed batch before itself", async () => {
+  const oc = cookieOf((await call("POST", "/api/signup", { handle: "gapowner", password: "longenough1" })).res);
+  const ws = await call("POST", "/api/workspaces", { name: "Gap Test" }, oc);
+  const gslug = ws.body.slug;
+  await call("POST", `/api/ws/${gslug}/channels/general/messages`, { text: "gap baseline" }, oc);
+  const html = await (await fetch(`${base}/w/${gslug}`)).text();
+  const page = browser(html, { url: `${base}/w/${gslug}`, sid: oc.split("=")[1] });
+  const doc = page.document;
+  await until(() => [...doc.querySelector("#log").children].some((n) => n.textContent.includes("gap baseline")), "initial history rendered");
+
+  // Five messages the page never hears about; only the last one arrives
+  // live, so ids baseline+1..baseline+4 would be skipped forever if the
+  // client recovered from the live event's id instead of its covered cursor.
+  const ids = [];
+  for (let i = 0; i < 5; i++) {
+    const r = await call("POST", `/api/ws/${gslug}/channels/general/messages`, { text: `missed ${i}` }, oc);
+    ids.push(r.body.message.id);
+  }
+  const es = FakeEventSource.last;
+  es.emit("message", JSON.stringify({ type: "message", id: ids[4], channel: "general", handle: "gapowner", text: "missed 4", at: new Date().toISOString() }));
+  await until(
+    () => [...doc.querySelector("#log").children].filter((n) => /missed \d/.test(n.textContent)).length === 5,
+    "the whole gap recovered, not just the live tail"
+  );
+  const logIds = [...doc.querySelector("#log").children].map((n) => Number(n.dataset.id));
+  assert.deepEqual(logIds, [...logIds].sort((a, b) => a - b), "messages render in message order");
+  assert.equal(new Set(logIds).size, logIds.length, "no duplicates");
+  page.window.close();
+});
+
+test("live events arriving during paginated recovery merge in order and nothing is lost", async () => {
+  const html = await (await fetch(`${base}/w/${recSlug}`)).text();
+  const page = browser(html, { url: `${base}/w/${recSlug}`, sid: recOwnerCookie.split("=")[1] });
+  const doc = page.document;
+  await until(() => [...doc.querySelector("#log").children].some((n) => n.textContent.includes("baseline")), "initial history rendered");
+
+  // A backlog beyond one recovery page (200), then live events emitted while
+  // the client is still paginating: they must wait in message order, not
+  // jump ahead of the pages still to come.
+  const backlog = await postBacklog(210, "backlog");
+  const live = [];
+  for (let i = 0; i < 3; i++) {
+    const r = await call("POST", `/api/ws/${recSlug}/channels/general/messages`, { text: `live during recovery ${i}` }, recOwnerCookie);
+    live.push(r.body.message);
+  }
+  const es = FakeEventSource.last;
+  es.open(); // recovery starts: page one, page two…
+  es.emit("message", JSON.stringify({ type: "message", id: live[0].id, channel: "general", handle: "recowner", text: live[0].text, at: live[0].at }));
+  es.emit("message", JSON.stringify({ type: "message", id: live[2].id, channel: "general", handle: "recowner", text: live[2].text, at: live[2].at }));
+
+  const expected = [...backlog, live[0].id, live[2].id];
+  await until(() => {
+    const got = [...doc.querySelector("#log").children].map((n) => n.dataset.id);
+    return expected.every((id) => got.includes(String(id)));
+  }, "every backlog page and every live event rendered");
+  const logIds = [...doc.querySelector("#log").children].map((n) => Number(n.dataset.id));
+  assert.deepEqual(logIds, [...logIds].sort((a, b) => a - b), "message order kept across the whole recovery");
+  assert.equal(new Set(logIds).size, logIds.length, "no duplicates across pages and live events");
+  page.window.close();
+});
+
+test("catching up on 200+ missed messages while search results are on screen terminates and resumes", async () => {
+  const html = await (await fetch(`${base}/w/${recSlug}`)).text();
+  const page = browser(html, { url: `${base}/w/${recSlug}`, sid: recOwnerCookie.split("=")[1] });
+  const doc = page.document;
+  await until(() => doc.querySelector("#log").children.length >= 1, "initial history rendered");
+
+  // Count recovery fetches so a catch-up loop that never advances its cursor
+  // cannot hide: the same page fetched forever would grow this without end.
+  let historyFetches = 0;
+  const inner = page.window.fetch;
+  page.window.fetch = (p, opts) => {
+    if (typeof p === "string" && p.includes("/messages?after=")) historyFetches++;
+    return inner(p, opts);
+  };
+
+  // Search view on; the log no longer shows the channel.
+  doc.querySelector('#form-search input[name="q"]').value = "needle";
+  doc.querySelector("#form-search").dispatchEvent(new page.window.Event("submit", { bubbles: true, cancelable: true }));
+  await until(() => doc.querySelector("#search-info").textContent.includes("0 match"), "search results on screen");
+
+  // More than a full recovery page is missed while searching, then the
+  // stream reopens and a live event arrives — all while search results,
+  // not the channel, are displayed.
+  await postBacklog(210, "while searching");
+  const live = await call("POST", `/api/ws/${recSlug}/channels/general/messages`, { text: "live while searching" }, recOwnerCookie);
+  const es = FakeEventSource.last;
+  es.open();
+  es.emit("message", JSON.stringify({ type: "message", id: live.body.message.id, channel: "general", handle: "recowner", text: live.body.message.text, at: live.body.message.at }));
+
+  // Recovery must terminate: wait until the fetch count stops moving.
+  await until(async () => {
+    const a = historyFetches;
+    await new Promise((r) => setTimeout(r, 300));
+    return historyFetches === a && a > 0;
+  }, "recovery fetches settle instead of looping");
+
+  // Back to the channel: history re-renders from the server, including the
+  // backlog and the live message, and the covered cursor resumes cleanly.
+  doc.querySelector("#search-back").onclick();
+  await until(() => [...doc.querySelector("#log").children].some((n) => n.textContent.includes("live while searching")), "the channel shows the live message again");
+  await until(() => [...doc.querySelector("#log").children].some((n) => n.textContent.includes("while searching 209")), "the oldest of the missed backlog is present too");
+  assert.ok(historyFetches < 10, `recovery paginated a bounded number of pages (${historyFetches}), it did not loop`);
+  const logIds = [...doc.querySelector("#log").children].map((n) => Number(n.dataset.id));
+  assert.deepEqual(logIds, [...logIds].sort((a, b) => a - b), "channel renders in message order after returning");
+  assert.equal(new Set(logIds).size, logIds.length, "no duplicates after returning from search");
+  page.window.close();
+});
+
 test("cleanup: server shuts down", async () => {
   fakeRpc.close();
   server.closeAllConnections();

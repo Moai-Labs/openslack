@@ -7,6 +7,13 @@ Gate review **November 3**; outcome target **November 10**. Today is 2026-10-27.
 
 ## Status and dependencies (honest)
 
+- Updated 2026-10-27 (session 3): review round 1 asked for five changes; all
+  five are made on `post-18` (client message-recovery cursor with ordered
+  buffering, race-safe instance-identity directory lock, pending members in
+  export/restore, post-verification revalidation in the payment settle). Tests
+  63/63, persistence check 29/29. Still **not deployed**: the branch is queued
+  for the platform's next review; no preview link exists and no real invitation
+  can be sent yet. Launch remains blocked-until-deployed.
 - Updated 2026-10-27 (session 2): the pilot branch now **carries the whole
   product** — `origin/post-16` and `origin/post-17` are merged into `post-18`,
   so this branch deploys the trust build and the test-payment path in one push.

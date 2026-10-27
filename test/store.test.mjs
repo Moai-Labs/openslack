@@ -257,6 +257,58 @@ test("export and restore round-trip; deletion removes everything", () => {
   assert.ok(!raw.includes("one"));
 });
 
+test("exports carry pending members; a partial attach round trip loses no identity", () => {
+  const s1 = freshStore();
+  const a = s1.createUser("alice", "longenough1");
+  const b = s1.createUser("bob", "longenough1");
+  const ws = s1.createWorkspace(a, "Pending Trip");
+  s1.joinWorkspace(ws, b);
+  const ch = s1.channelByName(ws.id, "general");
+  s1.postMessage(ws, ch, a, "hello");
+  const first = s1.buildExport(ws);
+  assert.deepEqual(first.pendingMembers, [], "nothing is pending while everyone is attached");
+  const bobJoinedAt = first.members.find((m) => m.handle === "bob").joinedAt;
+
+  // Restore with no attach: every identity is pending, the owner included.
+  const dir = s1.dir;
+  const s2 = new Store(dir).init();
+  s2.db = { users: [], sessions: [], workspaces: [], members: [], channels: [], invites: [], payments: [], paymentIntents: [], nextSeq: 1 };
+  s2.saveDb();
+  s2.saveLog([]);
+  const restored = s2.restoreExport(first);
+  assert.deepEqual((restored.pendingMembers || []).map((p) => [p.handle, p.role]), [["alice", "owner"], ["bob", "member"]]);
+
+  // Partial attach: only alice is verified and reattached.
+  const a2 = s2.createUser("alice", "new password 1");
+  s2.attachMember(restored, "alice", a2);
+  assert.equal(restored.ownerId, a2.id);
+
+  // The second export keeps bob — handle, role, original join time — and no
+  // account data: a pending record grants nothing.
+  const second = s2.buildExport(restored);
+  assert.deepEqual(
+    second.members,
+    [{ handle: "alice", role: "owner", joinedAt: first.members.find((m) => m.handle === "alice").joinedAt }]
+  );
+  assert.deepEqual(second.pendingMembers, [{ handle: "bob", role: "member", joinedAt: bobJoinedAt }]);
+  assert.ok(!JSON.stringify(second).includes("passHash"), "still no password material in exports");
+
+  // Restore that second export: bob is pending again with his original
+  // record, the workspace has an owner again through the verified attach,
+  // and the history made it through both round trips.
+  const s3 = freshStore();
+  const a3 = s3.createUser("alice", "newer password");
+  const restored2 = s3.restoreExport(second, { attach: [{ exportHandle: "alice", userId: a3.id }] });
+  assert.equal(restored2.ownerId, a3.id);
+  assert.deepEqual((restored2.pendingMembers || []).map((p) => [p.handle, p.role]), [["bob", "member"]]);
+  assert.equal(restored2.pendingMembers[0].joinedAt, bobJoinedAt, "the original join timestamp survives every hop");
+  assert.equal(s3.history(restored2.id, s3.channelByName(restored2.id, "general").id, {})[0].text, "hello");
+  const b3 = s3.createUser("bob", "longenough1");
+  s3.attachMember(restored2, "bob", b3);
+  assert.equal(s3.membership(restored2.id, b3.id).role, "member", "a twice-pending member attaches normally");
+  assert.equal(restored2.pendingMembers, undefined);
+});
+
 test("prune drops messages of deleted workspaces on restart", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-orphan-"));
   const s1 = new Store(dir).init();

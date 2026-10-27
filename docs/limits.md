@@ -18,20 +18,45 @@ direction requires. The product enforces these in code (`lib/limits.js`); tests 
 - Only the workspace owner can export or delete a workspace; any member can create
   channels and invite people while there is room.
 
-## Workspaces (paid tier — test payments only)
+## Workspaces (paid tier — verified test payments only)
 
 - A workspace can be moved to the paid tier for **$12 per 30 days**, granting up to
   **25 members** and history kept searchable for **365 days** (instead of the free
   tier's 30 days).
-- **These payments are labelled tests.** A test-USDC transfer is recorded as kind
-  `test` and counts as **zero revenue**: no real money moves and none is expected.
-  The tier line in the product always says "test payment".
+- **How a test payment is verified.** The owner opens a payment request in the
+  product, which shows exactly what to send: **12 test-USDC** (12,000,000 raw
+  units, 6 decimals) of Circle's USDC contract
+  `0x036CbD53842c5426634e7929541eC2318f3dCF7e` on **Base Sepolia** (chain id
+  84532), to the workspace's payment address. The owner sends that transfer from
+  any wallet and pastes the transaction hash; the server then verifies the
+  receipt read-only through a public JSON-RPC node — the chain id, the asset
+  contract (its code is checked to exist on that chain), the recipient, the exact
+  amount, and that the transaction settled (receipt status success, transfer log
+  present and not reorged away). Only a
+  verified, settled transfer grants anything; an unmined or reverted one leaves
+  the workspace on the free tier with a clear error, and the request stays open
+  for a retry.
+- **These payments are labelled tests.** Every record is kind `test` and counts as
+  **zero revenue**: the tokens on the test chain have no value and no real money
+  moves. The tier line in the product always says "test payment".
+- **One transfer, one entitlement.** The verified transaction hash is stored with
+  the payment and is refused if it was ever used before, in any workspace, so
+  replaying it cannot grant a second entitlement.
 - **Real payments stay blocked** until a supported checkout with verified settlement
   exists. There is no way to pay real money in this version.
-- The entitlement is per workspace, starts when the test payment is recorded, and
+- The entitlement is per workspace, starts when the transfer verifies, and
   stacks: paying again while the tier is active extends it by 30 more days. When it
   expires the workspace returns to the free tier limits on its own.
 - Exports do not carry the entitlement; a restored workspace starts on the free tier.
+- Deleting a workspace deletes its payment records with it.
+
+## Search
+
+- Every member can search their workspace's retained history from the product:
+  matches across **all channels**, newest first, each hit showing its channel,
+  with paging for older matches. Search covers everything retained for the
+  workspace (30 days free, 365 days paid), not just the newest page of a
+  channel, and never reaches outside the workspace.
 
 ## Messages and history
 

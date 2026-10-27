@@ -180,12 +180,85 @@ function initChat() {
   };
 
   const log = $("#log");
+  // While a workspace search is on screen the log holds search results, not
+  // the channel, so live messages must not land in it.
+  let searchView = false;
   const append = (m, channel) => {
-    if (channel !== current) return;
+    if (searchView || channel !== current) return;
     lastId = Math.max(lastId, Number(m.id)); // even for duplicates: the id is now covered
     if (log.querySelector(`[data-id="${m.id}"]`)) return;
     log.append(msgNode(m));
     log.scrollTop = log.scrollHeight;
+  };
+
+  // Search results read with their channel: a hit from another channel means
+  // little without "#where" next to it.
+  const resultNode = (m) => {
+    const div = msgNode(m);
+    const head = div.firstChild;
+    head.insertBefore(el("span", "who", "#" + m.channel + " · "), head.firstChild);
+    return div;
+  };
+
+  // Workspace-wide search over retained history: every channel, newest first,
+  // paging deeper than the first response with the `before` cursor.
+  const searchBar = $("#search-bar");
+  function exitSearch() {
+    if (!searchView) return;
+    searchView = false;
+    searchBar.hidden = true;
+  }
+
+  async function runSearch(query) {
+    searchView = true;
+    searchBar.hidden = false;
+    $("#search-info").textContent = `Searching for “${query}”…`;
+    let data;
+    try {
+      data = await api(`/api/ws/${slug}/search?q=${encodeURIComponent(query)}&limit=100`);
+    } catch (err) {
+      $("#search-info").textContent = err.message;
+      return;
+    }
+    if (!searchView) return; // the user went back to a channel meanwhile
+    log.textContent = "";
+    const n = data.messages.length;
+    $("#search-info").textContent =
+      `${n} match${n === 1 ? "" : "es"} for “${query}” across all channels (newest first)` +
+      (n === 100 ? " — older matches load below" : "");
+    if (!n) log.append(el("p", "hint", "Nothing retained matches. Search covers everything kept for this workspace, not just the newest page."));
+    for (const m of data.messages) log.append(resultNode(m));
+    log.scrollTop = 0;
+
+    // Page deeper: the next batch continues below the oldest id shown.
+    const addOlder = async (before) => {
+      const more = await api(`/api/ws/${slug}/search?q=${encodeURIComponent(query)}&limit=100&before=${before}`);
+      if (!searchView) return;
+      for (const m of more.messages) log.append(resultNode(m));
+      if (more.messages.length === 100) {
+        const btn = el("button", "load-more", "Load older matches");
+        btn.onclick = () => addOlder(more.messages[more.messages.length - 1].id).catch((err) => setError(err.message));
+        log.append(btn);
+      }
+      return more.messages.length;
+    };
+    if (n === 100) {
+      const btn = el("button", "load-more", "Load older matches");
+      btn.onclick = () => addOlder(data.messages[data.messages.length - 1].id).catch((err) => setError(err.message));
+      log.append(btn);
+    }
+  }
+
+  $("#form-search").onsubmit = async (e) => {
+    e.preventDefault();
+    setError("");
+    const q = new FormData(e.target).get("q").trim();
+    if (q) await runSearch(q);
+  };
+
+  $("#search-back").onclick = () => {
+    exitSearch();
+    switchChannel(current).catch(() => {});
   };
 
   async function fetchHistory(channel, after, limit) {
@@ -225,6 +298,7 @@ function initChat() {
     current = name;
     lastId = 0;
     log.textContent = "";
+    exitSearch();
     $("#ch-name").textContent = "#" + name;
     document.querySelectorAll("#channels button").forEach((b) => b.classList.toggle("active", b.textContent === "#" + name));
     await loadHistory(name);
@@ -286,14 +360,47 @@ function initChat() {
     } catch (err) { setError(err.message); }
   };
 
-  // Clearly labelled test payment: grants the 30-day paid tier but is never
-  // real money and counts as zero revenue. Real payments stay blocked.
+  // Clearly labelled test payment, in two steps: the product shows the exact
+  // payment request (test chain, asset, recipient, amount), the owner sends
+  // that transfer from any wallet on the test chain, and the product verifies
+  // the settled transaction before showing the entitlement. It is never real
+  // money and counts as zero revenue; real payments stay blocked.
   $("#pay-test-btn").onclick = async () => {
-    if (!confirm("Send a TEST payment of $12 in test-USDC for the 30-day paid tier?\n\nThis is a labelled test: no real money moves and it counts as zero revenue.")) return;
+    const panel = $("#pay-panel");
+    setError("");
     try {
-      await api(`/api/ws/${slug}/pay-test`, { method: "POST" });
+      const req = await api(`/api/ws/${slug}/pay-test/start`, { method: "POST" });
+      $("#pay-details").textContent =
+        `TEST payment — ${req.amountUsdc} test-USDC (this is a labelled test, zero revenue; real payments are not accepted yet).\n` +
+        `Send exactly ${req.amountRaw} raw units (${req.amountUsdc} USDC, 6 decimals) of the USDC contract ${req.asset}\n` +
+        `on ${req.chainName} (chain id ${req.chainId}) to ${req.recipient}, then paste the transaction hash below.`;
+      $("#pay-error").textContent = "";
+      $("#pay-tx").value = "";
+      $("#pay-tx").dataset.intentId = req.intentId;
+      panel.hidden = false;
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
+  $("#pay-cancel").onclick = () => {
+    $("#pay-panel").hidden = true;
+  };
+
+  $("#form-pay").onsubmit = async (e) => {
+    e.preventDefault();
+    const errEl = $("#pay-error");
+    errEl.textContent = "";
+    try {
+      await api(`/api/ws/${slug}/pay-test/confirm`, {
+        method: "POST",
+        body: { intentId: $("#pay-tx").dataset.intentId, txHash: $("#pay-tx").value.trim() }
+      });
+      $("#pay-panel").hidden = true;
       await loadWs();
-    } catch (err) { setError(err.message); }
+    } catch (err) {
+      errEl.textContent = err.message; // e.g. not settled yet, wrong amount, already used
+    }
   };
 
   $("#delete-btn").onclick = async () => {

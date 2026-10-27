@@ -10,12 +10,36 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import http from "node:http";
 import { JSDOM, VirtualConsole } from "jsdom";
 
+// The test-USDC payment node, scripted: the browser tests exercise the real
+// payment flow (request, verify, entitlement) against these receipts.
+let chainId = "0x14a34"; // 84532 = Base Sepolia
+let assetCode = "0x6080"; // non-empty: the asset contract exists
+let receipts = new Map(); // txHash (lowercase) -> receipt object
+const fakeRpc = http.createServer((req, res) => {
+  let body = "";
+  req.on("data", (c) => (body += c));
+  req.on("end", () => {
+    const { method, params } = JSON.parse(body);
+    let result = null;
+    if (method === "eth_chainId") result = chainId;
+    else if (method === "eth_getCode") result = assetCode;
+    else if (method === "eth_getTransactionReceipt") result = receipts.get(String(params[0]).toLowerCase()) ?? null;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result }));
+  });
+});
+await new Promise((resolve) => fakeRpc.listen(0, "127.0.0.1", resolve));
+
+process.env.PAY_RPC_URL = `http://127.0.0.1:${fakeRpc.address().port}`;
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-browser-"));
 process.env.PORT = "0";
 process.env.NODE_ENV = "test";
 const server = (await import("../server.js")).default;
+const LIMITS = (await import("../lib/limits.js")).default;
+const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
 async function onceReady() {
   for (let i = 0; i < 100; i++) {
@@ -109,7 +133,7 @@ function browser(html, { url = `${base}/`, sid = null } = {}) {
 
 // Wait until fn() is truthy and hand back that value; the client is async all
 // the way down.
-async function until(fn, what, ms = 2000) {
+async function until(fn, what, ms = 8000) {
   const end = Date.now() + ms;
   for (;;) {
     const v = await fn();
@@ -262,7 +286,180 @@ test("owner tools appear for the owner and work; non-owners never see them", asy
   guestPage.window.close();
 });
 
+// ---- the labelled test-USDC payment, driven through the real product ----
+
+const TX = (n) => "0x" + String(n).padStart(2, "0") + "0".repeat(62); // unique per number
+const receiptFor = (txHash) => {
+  const pad = (a) => "0x" + "0".repeat(24) + a.toLowerCase().slice(2);
+  return {
+    blockHash: "0x" + "ab".repeat(32),
+    blockNumber: "0x30a3797",
+    status: "0x1",
+    logs: [
+      {
+        address: LIMITS.PAY_USDC_ADDRESS,
+        topics: [TRANSFER_TOPIC, pad("0x1111000000000000000000000000000000000001"), pad(LIMITS.PAY_RECIPIENT)],
+        data: "0x" + (BigInt(LIMITS.PAID_PRICE_USDC) * 10n ** 6n).toString(16).padStart(64, "0"),
+        blockNumber: "0x30a3797",
+        logIndex: "0x0",
+        removed: false,
+        transactionHash: txHash
+      }
+    ]
+  };
+};
+
+let paySlug, payOwnerCookie;
+
+test("seed: a workspace an owner will pay for, with a member beside them", async () => {
+  payOwnerCookie = cookieOf((await call("POST", "/api/signup", { handle: "payowner", password: "longenough1" })).res);
+  const ws = await call("POST", "/api/workspaces", { name: "Payment Browser" }, payOwnerCookie);
+  paySlug = ws.body.slug;
+  await call("POST", `/api/ws/${paySlug}/channels/general/messages`, { text: "hello before paying" }, payOwnerCookie);
+});
+
+test("an owner sees the test-payment control, completes the verified flow, and sees the entitlement", async () => {
+  const html = await (await fetch(`${base}/w/${paySlug}`)).text();
+  const page = browser(html, { url: `${base}/w/${paySlug}`, sid: payOwnerCookie.split("=")[1] });
+  const doc = page.document;
+
+  // the control is revealed by clearing the HTML hidden property itself
+  await until(() => doc.querySelector("#pay-test-btn").hidden === false, "pay control revealed for the owner");
+  assert.equal(doc.querySelector("#tier-info").textContent.includes("Free tier"), true, "starts on the free tier");
+
+  // step 1: the product shows the exact payment request, labelled as a test
+  doc.querySelector("#pay-test-btn").onclick();
+  await until(() => doc.querySelector("#pay-panel").hidden === false, "payment panel opened");
+  const details = doc.querySelector("#pay-details").textContent;
+  assert.match(details, /TEST payment/);
+  assert.match(details, new RegExp(LIMITS.PAY_RECIPIENT));
+  assert.match(details, new RegExp(LIMITS.PAY_USDC_ADDRESS, "i"));
+  assert.match(details, /12000000/);
+  assert.match(details, /Base Sepolia/);
+  assert.match(details, /zero revenue/);
+
+  // step 2 with a hash the test chain has never seen: the product refuses and
+  // explains, and nothing is granted
+  receipts.delete(TX(70));
+  doc.querySelector("#pay-tx").dataset.intentId = (
+    await (async () => {
+      const r = await call("POST", `/api/ws/${paySlug}/pay-test/start`, null, payOwnerCookie);
+      return r.body.intentId;
+    })()
+  );
+  doc.querySelector("#pay-tx").value = TX(70);
+  doc.querySelector("#form-pay").dispatchEvent(new page.window.Event("submit", { bubbles: true, cancelable: true }));
+  await until(() => doc.querySelector("#pay-error").textContent.includes("not settled"), "unsettled hash explained in the product");
+  assert.equal(doc.querySelector("#tier-info").textContent.includes("Free tier"), true, "still free after a failed verification");
+
+  // the real, settled transfer verifies and the entitlement appears
+  receipts.set(TX(70), receiptFor(TX(70)));
+  doc.querySelector("#form-pay").dispatchEvent(new page.window.Event("submit", { bubbles: true, cancelable: true }));
+  await until(() => doc.querySelector("#tier-info").textContent.includes("Paid tier (test payment)"), "paid tier shown");
+  assert.match(doc.querySelector("#tier-info").textContent, /365-day history/);
+  assert.equal(doc.querySelector("#pay-panel").hidden, true, "panel closes after success");
+
+  // server-side: the entitlement is real and carries the verified hash
+  const info = await call("GET", `/api/ws/${paySlug}`, null, payOwnerCookie);
+  assert.equal(info.body.tier, "paid");
+  assert.equal(info.body.payments[0].txHash, TX(70));
+  assert.equal(info.body.payments[0].revenue, 0);
+  page.window.close();
+});
+
+test("a non-owner never sees the payment control", async () => {
+  const guest = cookieOf((await call("POST", "/api/signup", { handle: "payguest", password: "longenough1" })).res);
+  const inv = await call("POST", "/api/invites", { slug: paySlug }, payOwnerCookie);
+  await call("POST", `/api/invites/${inv.body.token}/join`, null, guest);
+  const html = await (await fetch(`${base}/w/${paySlug}`)).text();
+  const page = browser(html, { url: `${base}/w/${paySlug}`, sid: guest.split("=")[1] });
+  await until(() => page.document.querySelector("#log").children.length >= 1, "history rendered");
+  assert.equal(page.document.querySelector("#pay-test-btn").hidden, true, "no payment control for a member");
+  assert.equal((await call("POST", `/api/ws/${paySlug}/pay-test/start`, null, guest)).res.status, 403);
+  page.window.close();
+});
+
+// ---- searchable history, driven through the real product ----
+
+let searchSlug, searchOwnerCookie;
+
+test("seed: a workspace with older history beyond the newest page", async () => {
+  searchOwnerCookie = cookieOf((await call("POST", "/api/signup", { handle: "searchowner", password: "longenough1" })).res);
+  const ws = await call("POST", "/api/workspaces", { name: "Search Browser" }, searchOwnerCookie);
+  searchSlug = ws.body.slug;
+  await call("POST", `/api/ws/${searchSlug}/channels`, { name: "random" }, searchOwnerCookie);
+  // 120 matching messages: the workspace fills its free tier (owner + 4), and
+  // four senders at 24 each stays inside every sender's per-minute budget
+  const posters = [searchOwnerCookie];
+  for (let i = 0; i < 4; i++) posters.push(cookieOf((await call("POST", "/api/signup", { handle: `p${i}`, password: "longenough1" })).res));
+  const inv = await call("POST", "/api/invites", { slug: searchSlug }, searchOwnerCookie);
+  for (const cookie of posters.slice(1)) await call("POST", `/api/invites/${inv.body.token}/join`, null, cookie);
+  for (let i = 0; i < 24; i++) {
+    for (const cookie of posters) {
+      const r = await call("POST", `/api/ws/${searchSlug}/channels/general/messages`, { text: `pearl ${i} of ${cookie.slice(-6)}` }, cookie);
+      assert.equal(r.res.status, 201, "every seeded message lands");
+    }
+  }
+  await call("POST", `/api/ws/${searchSlug}/channels/random/messages`, { text: "a treasure hidden in another channel" }, searchOwnerCookie);
+});
+
+test("search finds matches beyond the latest page, names the channel of each hit, and can go back", async () => {
+  const html = await (await fetch(`${base}/w/${searchSlug}`)).text();
+  const page = browser(html, { url: `${base}/w/${searchSlug}`, sid: searchOwnerCookie.split("=")[1] });
+  const doc = page.document;
+  await until(() => doc.querySelector("#log").children.length >= 1, "initial history rendered");
+
+  // search across the workspace: the first page holds 100 of the 120 matches,
+  // newest first — already more than the channel view ever shows
+  doc.querySelector('#form-search input[name="q"]').value = "pearl";
+  doc.querySelector("#form-search").dispatchEvent(new page.window.Event("submit", { bubbles: true, cancelable: true }));
+  await until(() => doc.querySelector("#search-info").textContent.includes("100 matches"), "first page of matches counted");
+  assert.match(doc.querySelector("#search-info").textContent, /older matches load below/);
+  assert.ok(
+    [...doc.querySelector("#log").querySelectorAll("[data-id]")].every((n) => n.textContent.includes("#general")),
+    "each hit shows its channel"
+  );
+
+  // page deeper, past what the channel's newest page holds
+  doc.querySelector(".load-more").onclick();
+  await until(() => doc.querySelector("#log").querySelectorAll("[data-id]").length >= 120, "older matches loaded");
+
+  // a hit in another channel carries that channel's name
+  doc.querySelector('#form-search input[name="q"]').value = "treasure";
+  doc.querySelector("#form-search").dispatchEvent(new page.window.Event("submit", { bubbles: true, cancelable: true }));
+  await until(() => [...doc.querySelector("#log").children].some((n) => n.textContent.includes("#random")), "the random-channel hit names its channel");
+
+  // back to the live channel: the log is the channel again
+  doc.querySelector("#search-back").onclick();
+  await until(() => doc.querySelector("#search-bar").hidden === true, "search bar hidden");
+  await until(() => [...doc.querySelector("#log").children].some((n) => n.textContent.includes("pearl")), "channel history restored");
+  page.window.close();
+});
+
+test("history renders again after a reload and when switching channels", async () => {
+  // a fresh page (what a reload is) renders the channel's stored history,
+  // which the API returns as chId rows without a channel name
+  const html = await (await fetch(`${base}/w/${searchSlug}`)).text();
+  const page = browser(html, { url: `${base}/w/${searchSlug}`, sid: searchOwnerCookie.split("=")[1] });
+  const doc = page.document;
+  await until(() => doc.querySelector("#log").children.length >= 1, "history after reload");
+
+  // switch to #random and its message renders; switch back and #general's does
+  const randomBtn = [...doc.querySelectorAll("#channels button")].find((b) => b.textContent === "#random");
+  randomBtn.onclick();
+  await until(() => [...doc.querySelector("#log").children].some((n) => n.textContent.includes("treasure")), "random channel history renders after the switch");
+  const generalBtn = [...doc.querySelectorAll("#channels button")].find((b) => b.textContent === "#general");
+  generalBtn.onclick();
+  await until(() => [...doc.querySelector("#log").children].some((n) => n.textContent.includes("pearl")), "general history renders after switching back");
+  assert.ok(
+    [...doc.querySelector("#log").children].every((n) => !n.textContent.includes("treasure")),
+    "the other channel's message does not linger"
+  );
+  page.window.close();
+});
+
 test("cleanup: server shuts down", async () => {
+  fakeRpc.close();
   server.closeAllConnections();
   await new Promise((resolve) => server.close(resolve));
   assert.ok(true);

@@ -45,4 +45,6 @@ an autonomous agent together with the people who hold its token.
 ## What is deliberately out
 
 Voice, file hosting, bots and token gates (deferred by the adopted direction), message
-editing, read receipts, real payments (a labelled test-USDC path is the next step).
+editing, read receipts, real payments. The paid tier exists only through labelled,
+chain-verified test-USDC payments (see docs/limits.md); real payments stay blocked
+until a supported checkout with verified settlement exists.

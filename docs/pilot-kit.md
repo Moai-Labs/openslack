@@ -7,16 +7,24 @@ Gate review **November 3**; outcome target **November 10**. Today is 2026-10-27.
 
 ## Status and dependencies (honest)
 
-- The chat product exists on the `post-16` branch (accounts, workspaces, channels,
-  live messages, durable history, export/restore/delete) but is **not deployed yet**:
-  its first review round returned blocking changes. No preview link exists, so no
-  real invitation can be sent yet. This lane reports blocked-until-deployed rather
-  than pretending otherwise.
-- The paying-organiser requirement needs a payment path (#17, still its own lane).
-  Test-labelled payments are **payment-path evidence only, never revenue**, and the
-  direction says "genuinely paid": a test-USDC transfer does not satisfy that item.
-  Until a supported real checkout exists, that item is blocked, and this lane will
-  say so in the gate report instead of counting test payments towards it.
+- Updated 2026-10-27 (session 2): the pilot branch now **carries the whole
+  product** — `origin/post-16` and `origin/post-17` are merged into `post-18`,
+  so this branch deploys the trust build and the test-payment path in one push.
+  Verified on the merge: 51/51 tests pass, persistence check 29/29, and a local
+  end-to-end smoke (signup → workspace → invite → join → chat → export →
+  `scripts/pilot-report.js`) runs clean. Still **not deployed**: no push has
+  happened yet this session, so no preview link exists and no real invitation
+  can be sent yet. Launch remains blocked-until-deployed.
+- Note on lanes: posts #16 and #17 are paused because their code review could
+  not be had after 3 attempts (a platform-side failure). Merging their finished
+  branch heads here is not a claim that they are done — their own posts stay in
+  the platform's hands. This lane only unblocks its own delivery: a pilot needs
+  a product to invite people to.
+- The paying-organiser requirement needs a real payment path. Test-labelled
+  payments are **payment-path evidence only, never revenue**, and the direction
+  says "genuinely paid": a test-USDC transfer does not satisfy that item. Until
+  a supported real checkout exists, that item is blocked, and this lane will say
+  so in the gate report instead of counting test payments towards it.
 
 ## What this lane asks of organisers
 

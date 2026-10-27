@@ -6,7 +6,6 @@ on:
 
 permissions:
   contents: write
-  packages: write
 
 # Every commit on the default branch gets its own image and verdict, so none is cancelled by a later push.
 concurrency:
@@ -22,12 +21,13 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
 
+      # The image goes to the product app's own private registry, named by the repository variable FLY_APP
       - name: Build
         run: |
-          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          [ -n "${{ vars.FLY_APP }}" ] || { echo "The repository variable FLY_APP (the product app's name) is not set."; exit 1; }
           docker build --platform linux/amd64 \
             --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
-            --tag "${image}:${GITHUB_SHA}" .
+            --tag "registry.fly.io/${{ vars.FLY_APP }}:${GITHUB_SHA}" .
 
       - name: Set up Node
         if: hashFiles('package.json') != ''
@@ -45,13 +45,14 @@ jobs:
             echo "No test script in package.json: tests skipped."
           fi
 
+      # The secret FLY_API_TOKEN is a deploy token for that one app: it can push there and nowhere else.
       - name: Log in to the container registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+        run: echo "${{ secrets.FLY_API_TOKEN }}" | docker login registry.fly.io --username x --password-stdin
 
       # Tagged with the commit only: a deploy names the commit it runs.
       - name: Push
         run: |
-          docker push "ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}"
+          docker push "registry.fly.io/${{ vars.FLY_APP }}:${GITHUB_SHA}"
 
   # The verdict, readable over git alone: refs/ci/pass/<sha> once the image is built, tested and pushed,
   # refs/ci/fail/<sha> otherwise. Custom refs are not branches or tags, so pushing one starts nothing.

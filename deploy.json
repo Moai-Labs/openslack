@@ -2,7 +2,7 @@
   "services": [
     {
       "name": "web",
-      "image": "ghcr.io/moai-labs/openslack",
+      "image": "registry.fly.io/fl-dev-a08b773d-0291-4db7-b6c9-9c2a93c26218",
       "port": 3000,
       "cpus": 1,
       "memory_mb": 512,

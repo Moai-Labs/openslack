@@ -7,25 +7,59 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { Store } = require("./lib/store");
 const { Api, sendJson } = require("./lib/api");
+const { acquire } = require("./lib/lock");
 const pages = require("./lib/pages");
 const LIMITS = require("./lib/limits");
 
 const PORT = process.env.PORT != null && process.env.PORT !== "" ? Number(process.env.PORT) : 3000;
+const isProduction = process.env.NODE_ENV === "production";
 
-// The data directory holds everything that must survive a redeploy. In
-// production it is a mounted volume named by DATA_DIR (deploy.json). If that
-// path is not usable the server still boots on a local fallback, but /healthz
-// reports storage.durable=false so the deployment check catches it.
+// Is this path on a filesystem of its own — i.e. a mounted volume rather than
+// the container's own writable layer, which vanishes with the container?
+function isSeparateMount(p) {
+  try {
+    return fs.statfsSync(p).dev !== fs.statfsSync(path.parse(p).root).dev;
+  } catch {
+    return false;
+  }
+}
+
+// The data directory holds everything that must survive a redeploy. In the
+// deployed image it is the mounted volume named by DATA_DIR (deploy.json).
+// Writability alone proves nothing — a container-local path is writable and
+// still loses every message at the next deploy — so durability is claimed
+// only for a writable path on a separate mount, and a deployment that cannot
+// provide one refuses to start rather than quietly accepting private data it
+// cannot keep.
 function resolveDataDir() {
   const wanted = process.env.DATA_DIR;
   if (wanted) {
+    const probe = path.join(wanted, `.write-probe-${process.pid}`);
     try {
       fs.mkdirSync(wanted, { recursive: true });
-      fs.accessSync(wanted, fs.constants.W_OK);
-      return { dir: wanted, durable: true };
+      fs.writeFileSync(probe, "ok");
+      fs.unlinkSync(probe);
+      const durable = isSeparateMount(wanted);
+      if (!durable) {
+        const message = `${wanted} is writable but on the container's own filesystem, so nothing written there survives a redeploy.`;
+        if (isProduction) {
+          console.error(`refusing to start: ${message} Mount the persistent volume there.`);
+          process.exit(1);
+        }
+        console.warn(`warning: ${message} /healthz will report storage.durable=false.`);
+      }
+      return { dir: wanted, durable };
     } catch (err) {
-      console.error(`DATA_DIR ${wanted} is not usable (${err.message}); falling back to local storage.`);
+      const message = `DATA_DIR ${wanted} is not usable: ${err.message}`;
+      if (isProduction) {
+        console.error(`refusing to start: ${message} Check the volume mount and the node user's write permission.`);
+        process.exit(1);
+      }
+      console.error(`${message}; falling back to local storage.`);
     }
+  } else if (isProduction) {
+    console.error("refusing to start: DATA_DIR is not set; without it messages live on the container's own filesystem and a redeploy loses them.");
+    process.exit(1);
   }
   const local = path.join(process.cwd(), "data");
   fs.mkdirSync(local, { recursive: true });
@@ -33,12 +67,23 @@ function resolveDataDir() {
 }
 
 const { dir: dataDir, durable } = resolveDataDir();
+
+// One owner per data directory: a restore run against a live server would be
+// overwritten by the server's stale in-memory state on its next save.
+let dirLock;
+try {
+  dirLock = acquire(dataDir, "server");
+} catch (err) {
+  console.error(`refusing to start: ${err.message}`);
+  process.exit(1);
+}
+
 const store = new Store(dataDir).init();
 const api = new Api(store, (req) => {
   const host = req.headers.host || "localhost:3000";
   const proto = (req.headers["x-forwarded-proto"] || "").split(",")[0].trim() || "http";
   return `${proto}://${host}`;
-});
+}, { durable });
 
 const publicDir = path.join(__dirname, "public");
 const staticFiles = new Map(
@@ -98,11 +143,12 @@ beat.unref();
 sweep.unref();
 
 server.listen(PORT, () => {
-  console.log(`listening on ${PORT}, data in ${dataDir} (${durable ? "volume" : "local fallback"})`);
+  console.log(`listening on ${PORT}, data in ${dataDir} (${durable ? "persistent volume" : "NOT durable: local storage"})`);
 });
 
 async function shutdown() {
   api.closeAll();
+  dirLock.release();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 2000).unref();
 }

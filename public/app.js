@@ -12,7 +12,11 @@ async function api(path, opts = {}) {
     body: opts.body ? JSON.stringify(opts.body) : undefined
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  if (!res.ok) {
+    const err = new Error(data.error || `Request failed (${res.status})`);
+    err.status = res.status;
+    throw err;
+  }
   return data;
 }
 
@@ -27,10 +31,29 @@ function show(sel, on) {
   $(sel).classList.toggle("hidden", !on);
 }
 
+// A pending invitation survives sign-up in sessionStorage. It is cleared only
+// once the join succeeded or the server explicitly refused it (invalid link,
+// workspace full); a network failure or a server crash keeps it pending so a
+// later visit still resumes it.
+async function resumePendingInvite(onError) {
+  const token = sessionStorage.getItem("pendingInvite");
+  if (!token) return false;
+  try {
+    const joined = await api(`/api/invites/${encodeURIComponent(token)}/join`, { method: "POST" });
+    sessionStorage.removeItem("pendingInvite");
+    location.href = `/w/${joined.slug}`;
+    return true;
+  } catch (err) {
+    if (err instanceof TypeError || (err.status >= 500 && err.status < 600)) return false; // still pending
+    sessionStorage.removeItem("pendingInvite"); // refused: invalid link, full workspace, signed out
+    if (onError) onError(`Your invitation could not be completed: ${err.message}`);
+    return false;
+  }
+}
+
 // ---- home page (auth + workspace list) ----
 
 function initHome() {
-  const auth = $("#auth"), dash = $("#dash");
   const setError = (msg) => { const e = $("#auth-error"); e.textContent = msg || ""; show("#auth-error", !!msg); };
 
   $("#tab-signin").onclick = () => {
@@ -78,6 +101,8 @@ function initHome() {
     show("#dash", !!me.user);
     if (!me.user) return;
     $("#hello").textContent = `@${me.user.handle}`;
+    // An invitation followed us through sign-up or sign-in: complete it now.
+    await resumePendingInvite(setError);
     const list = $("#ws-list");
     list.textContent = "";
     if (!me.workspaces.length) {
@@ -95,9 +120,11 @@ function initHome() {
 }
 
 // ---- join page ----
+// The token is server-rendered into a data attribute (inline script is
+// blocked by the site's Content-Security-Policy).
 
 function initJoin() {
-  const token = window.__INVITE__;
+  const token = document.querySelector("#join").dataset.token || "";
   api(`/api/invites/${encodeURIComponent(token)}`)
     .then((info) => {
       $("#invite-info").textContent = `You are invited to “${info.workspace.name}”.`;
@@ -111,14 +138,17 @@ function initJoin() {
             return;
           }
           const joined = await api(`/api/invites/${encodeURIComponent(token)}/join`, { method: "POST" });
+          sessionStorage.removeItem("pendingInvite");
           location.href = `/w/${joined.slug}`;
         } catch (err) {
           const e = $("#join-error"); e.textContent = err.message; show("#join-error", true);
+          if (err.status === 404 || err.status === 403) sessionStorage.removeItem("pendingInvite");
         }
       };
     })
     .catch((err) => {
       $("#invite-info").textContent = err.message;
+      sessionStorage.removeItem("pendingInvite"); // an invalid invitation is dead; do not carry it along
     });
 }
 
@@ -127,7 +157,9 @@ function initJoin() {
 function initChat() {
   const slug = document.querySelector("#chat").dataset.slug;
   let current = "general";
-  let lastId = 0;
+  let lastId = 0; // last message id shown for the current channel
+  let historyGen = 0; // bumped on every switch; stale history responses are dropped
+  let channelReady = false; // the current channel's initial history has rendered
   let role = "member";
   let tier = "free";
   let maxMembers = 0;
@@ -148,28 +180,54 @@ function initChat() {
   };
 
   const log = $("#log");
-  const append = (m) => {
-    if (m.channel !== current) return;
+  const append = (m, channel) => {
+    if (channel !== current) return;
+    lastId = Math.max(lastId, Number(m.id)); // even for duplicates: the id is now covered
     if (log.querySelector(`[data-id="${m.id}"]`)) return;
     log.append(msgNode(m));
-    lastId = Math.max(lastId, Number(m.id));
     log.scrollTop = log.scrollHeight;
   };
 
-  async function loadHistory(after) {
-    const q = after != null ? `?after=${after}&limit=200` : "?limit=100";
-    const data = await api(`/api/ws/${slug}/channels/${current}/messages${q}`);
-    for (const m of data.messages) append(m);
-    if (after == null) log.scrollTop = log.scrollHeight;
+  async function fetchHistory(channel, after, limit) {
+    const q = after != null ? `after=${after}&limit=${limit}` : `limit=${limit}`;
+    return api(`/api/ws/${slug}/channels/${encodeURIComponent(channel)}/messages?${q}`);
+  }
+
+  // Initial fill: the newest page of the channel's history. History rows carry
+  // chId, not a channel name, so the requested channel is bound here and every
+  // response is checked against it before rendering.
+  async function loadHistory(channel) {
+    const gen = ++historyGen;
+    channelReady = false;
+    const data = await fetchHistory(channel, null, 100);
+    if (gen !== historyGen) return; // the user switched channels meanwhile
+    for (const m of data.messages) append(m, channel);
+    channelReady = true;
+    log.scrollTop = log.scrollHeight;
+  }
+
+  // Catch up on everything missed while the stream was down, oldest first,
+  // paginating until the server has nothing past the last displayed id.
+  async function catchUp(channel) {
+    if (!channelReady) return; // the initial load has not set lastId yet
+    const gen = ++historyGen;
+    for (;;) {
+      const data = await fetchHistory(channel, lastId, 200);
+      if (gen !== historyGen || channel !== current) return;
+      const missed = data.messages || [];
+      for (const m of missed) append(m, channel);
+      if (missed.length < 200) return;
+    }
   }
 
   async function switchChannel(name) {
+    historyGen++; // anything in flight for the old channel is now stale
     current = name;
     lastId = 0;
     log.textContent = "";
     $("#ch-name").textContent = "#" + name;
     document.querySelectorAll("#channels button").forEach((b) => b.classList.toggle("active", b.textContent === "#" + name));
-    await loadHistory(null);
+    await loadHistory(name);
   }
 
   function connect() {
@@ -177,12 +235,15 @@ function initChat() {
     const es = new EventSource(`/api/ws/${slug}/stream`);
     es.addEventListener("message", (e) => {
       const m = JSON.parse(e.data);
-      if (m.type === "message") {
-        loadHistory(m.id - 1).catch(() => {}); // catch anything missed while away
-        append(m);
-      }
+      if (m.type !== "message" || m.channel !== current) return;
+      const gap = Number(m.id) > lastId + 1; // something was missed mid-stream
+      append(m, m.channel);
+      if (gap) catchUp(current).catch(() => {});
     });
-    es.onopen = () => { conn.textContent = "live"; conn.classList.add("live"); };
+    es.onopen = () => {
+      conn.textContent = "live"; conn.classList.add("live");
+      catchUp(current).catch(() => {}); // recover anything missed while away
+    };
     es.onerror = () => {
       conn.textContent = "reconnecting…"; conn.classList.remove("live");
       es.close();
@@ -197,7 +258,7 @@ function initChat() {
     const text = input.value;
     input.value = "";
     try {
-      await api(`/api/ws/${slug}/channels/${current}/messages`, { method: "POST", body: { text } });
+      await api(`/api/ws/${slug}/channels/${encodeURIComponent(current)}/messages`, { method: "POST", body: { text } });
     } catch (err) {
       input.value = text;
       setError(err.message);
@@ -269,10 +330,13 @@ function initChat() {
       li.append(b);
       list.append(li);
     }
-    if (role === "owner") {
-      show("#export-btn", true), ($("#export-btn").href = `/api/ws/${slug}/export`), show("#delete-btn", true);
-      show("#pay-test-btn", info.tier !== "paid");
-    }
+    // Owner tools use the HTML hidden attribute, so revealing them means
+    // clearing the property itself; a CSS class alone would leave them hidden.
+    const isOwner = role === "owner";
+    $("#export-btn").hidden = !isOwner;
+    $("#delete-btn").hidden = !isOwner;
+    $("#pay-test-btn").hidden = !isOwner || info.tier === "paid";
+    if (isOwner) $("#export-btn").href = `/api/ws/${slug}/export`;
   }
 
   loadWs()
@@ -281,15 +345,6 @@ function initChat() {
     .catch((err) => {
       log.append(el("p", "error", err.message));
     });
-
-  // An invite followed us through sign-up on the home page.
-  const pending = sessionStorage.getItem("pendingInvite");
-  if (pending) {
-    sessionStorage.removeItem("pendingInvite");
-    api(`/api/invites/${encodeURIComponent(pending)}/join`, { method: "POST" })
-      .then((j) => { location.href = `/w/${j.slug}`; })
-      .catch(() => {});
-  }
 }
 
 // boot

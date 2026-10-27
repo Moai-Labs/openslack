@@ -49,14 +49,36 @@ direction requires. The product enforces these in code (`lib/limits.js`); tests 
 - All state lives on the server in one data directory on a persistent volume — not only
   in the running container. A restart or redeploy keeps every message.
 - Writes are fsynced before they are acknowledged, so a hard crash loses nothing that
-  was confirmed to the sender.
+  was confirmed to the sender. A crash mid-write can tear the final log record; the
+  next start repairs it (the incomplete tail is dropped, acknowledged messages stay)
+  before accepting new writes.
+- The deployment refuses to start on storage it cannot verify as a persistent volume:
+  `/healthz` reports the checked `durable` flag, and a container-local data path fails
+  the deployment instead of silently holding private data it would lose at the next
+  deploy.
 
 ## Export, restore, deletion
 
 - The owner can download a full JSON export of a workspace (channels, members by
   handle, full message history). Exports contain no password material.
 - A workspace can be rebuilt from an export with `node scripts/restore.js
-  <export.json>`; members regain access by signing in with their original handles.
+  <export.json>`. The restore command takes exclusive ownership of the data
+  directory and refuses to run while the server holds it — a restore against a
+  live server would be overwritten by the server's stale in-memory state.
+- **Membership recovery is administrator-controlled.** A handle is a public
+  identifier, not proof of identity, so signing up (or signing in) with a
+  handle from an export grants no access to a restored workspace. Every
+  exported member is preserved on the restored workspace as a *pending record*
+  with no access. The administrator attaches each pending member to an account
+  in the store they have verified out of band, naming both handles:
+
+      node scripts/restore.js export.json --attach alice=alice --attach bob=bob
+
+  (left side: the handle in the export; right side: an account that already
+  exists in the store). The first attached owner becomes the workspace owner.
+  Pending records are kept until they are attached this way; nothing expires
+  them and nothing else can attach them — the capability exists only in the
+  restore command, never in the HTTP API.
 - Deleting a workspace removes its channels, membership, invites and messages from the
   server immediately; this cannot be undone (keep an export first).
 

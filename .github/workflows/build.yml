@@ -13,7 +13,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  image:
+  # Builds and tests the repository's code with no registry credential anywhere on the runner: the tests run the
+  # repository's own scripts, so nothing they could read may be worth stealing. The image leaves as an artifact.
+  build:
     # Only the default branch is verified and publishes an image.
     if: github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
@@ -21,7 +23,7 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
 
-      # The image goes to the product app's own private registry, named by the repository variable FLY_APP
+      # The image is named for the product app's own private registry, by the repository variable FLY_APP
       - name: Build
         run: |
           [ -n "${{ vars.FLY_APP }}" ] || { echo "The repository variable FLY_APP (the product app's name) is not set."; exit 1; }
@@ -45,6 +47,45 @@ jobs:
             echo "No test script in package.json: tests skipped."
           fi
 
+      # The built image as data, for the publish job
+      - name: Save the image
+        run: |
+          docker save "registry.fly.io/${{ vars.FLY_APP }}:${GITHUB_SHA}" | gzip > image.tar.gz
+
+      - name: Upload the image
+        uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: image.tar.gz
+          retention-days: 1
+
+      # The verdict, readable over git alone: refs/ci/pass/<sha> once the image is built and tested, refs/ci/fail/<sha>
+      # otherwise. Custom refs are not branches or tags, so pushing one starts nothing.
+      - name: Publish the verdict
+        if: ${{ always() && github.event_name == 'push' }}
+        run: |
+          result=pass
+          if [ "${{ job.status }}" != success ]; then result=fail; fi
+          git push origin "HEAD:refs/ci/$result/${{ github.sha }}"
+          echo "$result ${{ github.sha }}"
+
+  # Pushes the built image. A fresh runner that checks out nothing and runs none of the repository's code: it loads
+  # the image as data and pushes it. The only job that sees the deploy token.
+  publish:
+    needs: [build]
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Download the image
+        uses: actions/download-artifact@v4
+        with:
+          name: image
+
+      - name: Load the image
+        run: |
+          gunzip -c image.tar.gz | docker load
+
       # The secret FLY_API_TOKEN is a deploy token for that one app: it can push there and nowhere else.
       - name: Log in to the container registry
         run: echo "${{ secrets.FLY_API_TOKEN }}" | docker login registry.fly.io --username x --password-stdin
@@ -53,20 +94,3 @@ jobs:
       - name: Push
         run: |
           docker push "registry.fly.io/${{ vars.FLY_APP }}:${GITHUB_SHA}"
-
-  # The verdict, readable over git alone: refs/ci/pass/<sha> once the image is built, tested and pushed,
-  # refs/ci/fail/<sha> otherwise. Custom refs are not branches or tags, so pushing one starts nothing.
-  verdict:
-    if: ${{ always() && github.event_name == 'push' && github.ref_name == github.event.repository.default_branch }}
-    needs: [image]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out
-        uses: actions/checkout@v4
-
-      - name: Publish the verdict
-        run: |
-          result=pass
-          if [ "${{ needs.image.result }}" != success ]; then result=fail; fi
-          git push origin "HEAD:refs/ci/$result/${{ github.sha }}"
-          echo "$result ${{ github.sha }}"

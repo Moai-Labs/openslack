@@ -1,35 +1,158 @@
-// Placeholder page until the product replaces it. Node's standard library only.
+// OpenSlack server: static pages, JSON API, SSE live updates.
+// Node standard library only — no runtime npm dependencies.
+"use strict";
+
 const http = require("node:http");
+const fs = require("node:fs");
+const path = require("node:path");
+const { Store } = require("./lib/store");
+const { Api, sendJson } = require("./lib/api");
+const { acquire } = require("./lib/lock");
+const pages = require("./lib/pages");
+const LIMITS = require("./lib/limits");
 
-const port = Number(process.env.PORT) || 3000;
-const page = `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Coming soon</title>
-<style>
-  body { margin: 0; min-height: 100vh; display: grid; place-items: center;
-         font-family: system-ui, sans-serif; background: #fafafa; color: #222; }
-  main { max-width: 32rem; padding: 2rem; text-align: center; }
-  h1 { font-size: 1.75rem; margin: 0 0 0.75rem; }
-  p { line-height: 1.5; color: #555; }
-</style>
-</head>
-<body>
-<main>
-  <h1>Coming soon</h1>
-  <p>This product is being built in the open. The first version will appear here.</p>
-</main>
-</body>
-</html>
-`;
+const PORT = process.env.PORT != null && process.env.PORT !== "" ? Number(process.env.PORT) : 3000;
+const isProduction = process.env.NODE_ENV === "production";
 
-http.createServer((req, res) => {
-    if (req.url === "/healthz") {
-        res.writeHead(200, {"content-type": "text/plain"});
-        return res.end("ok\n");
+// Is this path on a filesystem of its own — i.e. a mounted volume rather than
+// the container's own writable layer, which vanishes with the container?
+function isSeparateMount(p) {
+  try {
+    return fs.statfsSync(p).dev !== fs.statfsSync(path.parse(p).root).dev;
+  } catch {
+    return false;
+  }
+}
+
+// The data directory holds everything that must survive a redeploy. In the
+// deployed image it is the mounted volume named by DATA_DIR (deploy.json).
+// Writability alone proves nothing — a container-local path is writable and
+// still loses every message at the next deploy — so durability is claimed
+// only for a writable path on a separate mount, and a deployment that cannot
+// provide one refuses to start rather than quietly accepting private data it
+// cannot keep.
+function resolveDataDir() {
+  const wanted = process.env.DATA_DIR;
+  if (wanted) {
+    const probe = path.join(wanted, `.write-probe-${process.pid}`);
+    try {
+      fs.mkdirSync(wanted, { recursive: true });
+      fs.writeFileSync(probe, "ok");
+      fs.unlinkSync(probe);
+      const durable = isSeparateMount(wanted);
+      if (!durable) {
+        const message = `${wanted} is writable but on the container's own filesystem, so nothing written there survives a redeploy.`;
+        if (isProduction) {
+          console.error(`refusing to start: ${message} Mount the persistent volume there.`);
+          process.exit(1);
+        }
+        console.warn(`warning: ${message} /healthz will report storage.durable=false.`);
+      }
+      return { dir: wanted, durable };
+    } catch (err) {
+      const message = `DATA_DIR ${wanted} is not usable: ${err.message}`;
+      if (isProduction) {
+        console.error(`refusing to start: ${message} Check the volume mount and the node user's write permission.`);
+        process.exit(1);
+      }
+      console.error(`${message}; falling back to local storage.`);
     }
-    res.writeHead(200, {"content-type": "text/html; charset=utf-8"});
-    res.end(page);
-}).listen(port, () => console.log(`listening on ${port}`));
+  } else if (isProduction) {
+    console.error("refusing to start: DATA_DIR is not set; without it messages live on the container's own filesystem and a redeploy loses them.");
+    process.exit(1);
+  }
+  const local = path.join(process.cwd(), "data");
+  fs.mkdirSync(local, { recursive: true });
+  return { dir: local, durable: false };
+}
+
+const { dir: dataDir, durable } = resolveDataDir();
+
+// One owner per data directory: a restore run against a live server would be
+// overwritten by the server's stale in-memory state on its next save.
+let dirLock;
+try {
+  dirLock = acquire(dataDir, "server");
+} catch (err) {
+  console.error(`refusing to start: ${err.message}`);
+  process.exit(1);
+}
+
+const store = new Store(dataDir).init();
+const api = new Api(store, (req) => {
+  const host = req.headers.host || "localhost:3000";
+  const proto = (req.headers["x-forwarded-proto"] || "").split(",")[0].trim() || "http";
+  return `${proto}://${host}`;
+}, { durable });
+
+const publicDir = path.join(__dirname, "public");
+const staticFiles = new Map(
+  ["app.js", "style.css"].map((f) => ["/" + f, { file: path.join(publicDir, f), type: f.endsWith(".css") ? "text/css; charset=utf-8" : "text/javascript; charset=utf-8" }])
+);
+
+const server = http.createServer(async (req, res) => {
+  res.setHeader("x-content-type-options", "nosniff");
+  res.setHeader("referrer-policy", "no-referrer");
+  res.setHeader("content-security-policy", "default-src 'self'; frame-ancestors 'none'");
+
+  let pathname;
+  try {
+    pathname = decodeURIComponent(new URL(req.url, "http://x").pathname);
+  } catch {
+    return sendJson(res, 400, { error: "Bad URL." });
+  }
+
+  try {
+    if (await api.handle(req, res, pathname)) return;
+
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      return sendJson(res, 405, { error: "Method not allowed." });
+    }
+
+    const stat = staticFiles.get(pathname);
+    if (stat) {
+      const body = fs.readFileSync(stat.file);
+      res.writeHead(200, { "content-type": stat.type, "cache-control": "no-cache" });
+      return res.end(body);
+    }
+
+    if (pathname === "/" || pathname === "/index.html") {
+      return res.end(pages.home());
+    }
+    let m = pathname.match(/^\/join\/([A-Za-z0-9_-]+)$/);
+    if (m) {
+      return res.end(pages.join(m[1]));
+    }
+    m = pathname.match(/^\/w\/([a-z0-9-]+)$/);
+    if (m) {
+      return res.end(pages.chat(m[1]));
+    }
+
+    sendJson(res, 404, { error: "Not found." });
+  } catch (err) {
+    console.error("request error:", err);
+    if (!res.headersSent) sendJson(res, 500, { error: "Something went wrong." });
+    else res.end();
+  }
+});
+
+// Keep live connections healthy; never hold the process open on its own.
+const beat = setInterval(() => api.heartbeat(), LIMITS.SSE_HEARTBEAT_SECONDS * 1000);
+const sweep = setInterval(() => store.prune(), 60 * 60 * 1000);
+beat.unref();
+sweep.unref();
+
+server.listen(PORT, () => {
+  console.log(`listening on ${PORT}, data in ${dataDir} (${durable ? "persistent volume" : "NOT durable: local storage"})`);
+});
+
+async function shutdown() {
+  api.closeAll();
+  dirLock.release();
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 2000).unref();
+}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
+
+module.exports = server;

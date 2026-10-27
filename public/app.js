@@ -129,6 +129,8 @@ function initChat() {
   let current = "general";
   let lastId = 0;
   let role = "member";
+  let tier = "free";
+  let maxMembers = 0;
 
   const conn = $("#conn");
   const setError = (msg) => { const e = $("#msg-error"); e.textContent = msg || ""; show("#msg-error", !!msg); };
@@ -219,7 +221,17 @@ function initChat() {
       const out = $("#invite-out");
       out.textContent = inv.url;
       try { await navigator.clipboard.writeText(inv.url); } catch { /* clipboard may be blocked; the link is shown anyway */ }
-      $("#invite-out").append(el("div", null, "Anyone with this link and an account can join (free tier: 5 members)."));
+      $("#invite-out").append(el("div", null, `Anyone with this link and an account can join (${tier} tier: ${maxMembers} members).`));
+    } catch (err) { setError(err.message); }
+  };
+
+  // Clearly labelled test payment: grants the 30-day paid tier but is never
+  // real money and counts as zero revenue. Real payments stay blocked.
+  $("#pay-test-btn").onclick = async () => {
+    if (!confirm("Send a TEST payment of $12 in test-USDC for the 30-day paid tier?\n\nThis is a labelled test: no real money moves and it counts as zero revenue.")) return;
+    try {
+      await api(`/api/ws/${slug}/pay-test`, { method: "POST" });
+      await loadWs();
     } catch (err) { setError(err.message); }
   };
 
@@ -236,7 +248,15 @@ function initChat() {
     $("#ws-name").textContent = info.name;
     role = info.role;
     $("#ws-role").textContent = info.role;
+    tier = info.tier;
+    maxMembers = info.maxMembers;
     $("#member-count").textContent = `${info.members.length}/${info.maxMembers}`;
+    // The tier is always visible, and the paid tier is always labelled as a
+    // test payment — it is never presented as revenue.
+    $("#tier-info").textContent =
+      info.tier === "paid"
+        ? `Paid tier (test payment) — up to ${info.maxMembers} members, 365-day history, through ${new Date(info.paidUntil).toLocaleDateString()}.`
+        : `Free tier — up to ${info.maxMembers} members, 30-day history. Real payments are not accepted yet.`;
     const ul = $("#members");
     ul.textContent = "";
     for (const mem of info.members) ul.append(el("li", null, `@${mem.handle} (${mem.role})`));
@@ -249,7 +269,10 @@ function initChat() {
       li.append(b);
       list.append(li);
     }
-    if (role === "owner") show("#export-btn", true), ($("#export-btn").href = `/api/ws/${slug}/export`), show("#delete-btn", true);
+    if (role === "owner") {
+      show("#export-btn", true), ($("#export-btn").href = `/api/ws/${slug}/export`), show("#delete-btn", true);
+      show("#pay-test-btn", info.tier !== "paid");
+    }
   }
 
   loadWs()

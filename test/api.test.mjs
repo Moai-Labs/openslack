@@ -380,11 +380,12 @@ test("logging out ends a stream's live delivery; another session keeps receiving
             state.ended = true;
             return;
           }
-          const buf = (state._buf = (state._buf || "") + dec.decode(value, { stream: true }));
+          let buf = (state._buf = (state._buf || "") + dec.decode(value, { stream: true }));
           let i;
           while ((i = buf.indexOf("\n\n")) >= 0) {
             const chunk = buf.slice(0, i);
-            state._buf = buf.slice(i + 2);
+            buf = buf.slice(i + 2);
+            state._buf = buf;
             if (chunk.startsWith("event: message")) state.events.push(JSON.parse(chunk.split("data: ")[1]));
           }
           state._reader = reader;

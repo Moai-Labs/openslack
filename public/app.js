@@ -34,20 +34,25 @@ function show(sel, on) {
 // A pending invitation survives sign-up in sessionStorage. It is cleared only
 // once the join succeeded or the server explicitly refused it (invalid link,
 // workspace full); a network failure or a server crash keeps it pending so a
-// later visit still resumes it.
-async function resumePendingInvite(onError) {
+// later visit — or the retry button — still resumes it. `report` is called
+// with (message, retryable): retryable means the token is still pending and
+// trying again may work.
+async function resumePendingInvite(report) {
   const token = sessionStorage.getItem("pendingInvite");
-  if (!token) return false;
+  if (!token) return "none";
   try {
     const joined = await api(`/api/invites/${encodeURIComponent(token)}/join`, { method: "POST" });
     sessionStorage.removeItem("pendingInvite");
     location.href = `/w/${joined.slug}`;
-    return true;
+    return "joined";
   } catch (err) {
-    if (err instanceof TypeError || (err.status >= 500 && err.status < 600)) return false; // still pending
+    if (err instanceof TypeError || (err.status >= 500 && err.status < 600)) {
+      if (report) report(`We could not complete your invitation just now${err.message ? `: ${err.message}` : ""}. It is saved — try again.`, true);
+      return "retry";
+    }
     sessionStorage.removeItem("pendingInvite"); // refused: invalid link, full workspace, signed out
-    if (onError) onError(`Your invitation could not be completed: ${err.message}`);
-    return false;
+    if (report) report(`Your invitation could not be completed: ${err.message}`, false);
+    return "refused";
   }
 }
 
@@ -101,8 +106,23 @@ function initHome() {
     show("#dash", !!me.user);
     if (!me.user) return;
     $("#hello").textContent = `@${me.user.handle}`;
-    // An invitation followed us through sign-up or sign-in: complete it now.
-    await resumePendingInvite(setError);
+    // An invitation followed us through sign-up or sign-in: complete it now,
+    // in a place the signed-in visitor can actually see — the auth box with
+    // its error line is gone at this point.
+    const issue = $("#invite-issue");
+    const showIssue = (msg, retryable) => {
+      $("#invite-issue-text").textContent = msg;
+      $("#invite-retry").hidden = !retryable;
+      issue.classList.remove("hidden");
+    };
+    $("#invite-retry").onclick = async () => {
+      $("#invite-retry").disabled = true;
+      const state = await resumePendingInvite(showIssue);
+      if (state === "joined" || state === "none") issue.classList.add("hidden");
+      $("#invite-retry").disabled = false;
+    };
+    const state = await resumePendingInvite(showIssue);
+    if (state === "joined" || state === "none") issue.classList.add("hidden");
     const list = $("#ws-list");
     list.textContent = "";
     if (!me.workspaces.length) {
@@ -158,6 +178,8 @@ function initChat() {
   const slug = document.querySelector("#chat").dataset.slug;
   let current = "general";
   let lastId = 0; // last message id shown for the current channel
+  let recoverFrom = 0; // everything after this id still has to be fetched and merged
+  let recoverRun = 0; // which recovery loop owns the cursor; a new one supersedes it
   let historyGen = 0; // bumped on every switch; stale history responses are dropped
   let channelReady = false; // the current channel's initial history has rendered
   let role = "member";
@@ -181,13 +203,26 @@ function initChat() {
 
   const log = $("#log");
   // While a workspace search is on screen the log holds search results, not
-  // the channel, so live messages must not land in it.
+  // the channel, so live messages must not land in it. Recovery that runs
+  // during a search still advances its cursors — only the rendering waits.
   let searchView = false;
   const append = (m, channel) => {
     if (searchView || channel !== current) return;
     lastId = Math.max(lastId, Number(m.id)); // even for duplicates: the id is now covered
     if (log.querySelector(`[data-id="${m.id}"]`)) return;
-    log.append(msgNode(m));
+    // Insert in id order: a recovered gap must slot in before newer messages
+    // that were already rendered, never after them.
+    const node = msgNode(m);
+    const id = Number(m.id);
+    for (const child of log.children) {
+      const cid = Number(child.dataset && child.dataset.id);
+      if (Number.isFinite(cid) && cid > id) {
+        log.insertBefore(node, child);
+        log.scrollTop = log.scrollHeight;
+        return;
+      }
+    }
+    log.append(node);
     log.scrollTop = log.scrollHeight;
   };
 
@@ -276,27 +311,51 @@ function initChat() {
     if (gen !== historyGen) return; // the user switched channels meanwhile
     for (const m of data.messages) append(m, channel);
     channelReady = true;
+    recoverFrom = lastId; // everything up to the newest rendered id is held
     log.scrollTop = log.scrollHeight;
   }
 
-  // Catch up on everything missed while the stream was down, oldest first,
-  // paginating until the server has nothing past the last displayed id.
-  async function catchUp(channel) {
-    if (!channelReady) return; // the initial load has not set lastId yet
-    const gen = ++historyGen;
-    for (;;) {
-      const data = await fetchHistory(channel, lastId, 200);
-      if (gen !== historyGen || channel !== current) return;
-      const missed = data.messages || [];
-      for (const m of missed) append(m, channel);
-      if (missed.length < 200) return;
-    }
+  // Recover everything missed while the stream was down — a live gap or a full
+  // outage — oldest first, paginating until the server has nothing left.
+  //
+  // The cursor is the recovery's own, not the render's: appending a live event
+  // that revealed a gap must not move the cursor past the messages inside it,
+  // and a search on screen (which defers rendering) must not stall it either.
+  // Each page advances the cursor to the newest id it actually fetched, so the
+  // loop always moves forward and always terminates. A newer recovery supersedes
+  // a running one at the next page boundary; the cursor carries over, so no
+  // range is skipped.
+  function startRecovery(channel, fromId) {
+    if (!channelReady) return; // the initial load has not set the cursors yet
+    if (fromId != null) recoverFrom = Math.min(recoverFrom, Number(fromId)); // recover from before the gap
+    const run = ++recoverRun;
+    (async () => {
+      // The first page always fetches: a plain outage leaves messages the
+      // client never heard about, so no local cursor can say "nothing there".
+      for (let first = true; ; first = false) {
+        if (run !== recoverRun || channel !== current) return;
+        if (!first && recoverFrom >= lastId) return;
+        const data = await fetchHistory(channel, recoverFrom, 200);
+        if (run !== recoverRun || channel !== current) return;
+        const missed = data.messages || [];
+        for (const m of missed) append(m, channel); // rendering defers during a search; the cursor does not
+        if (missed.length) {
+          recoverFrom = Math.max(recoverFrom, Number(missed[missed.length - 1].id));
+          lastId = Math.max(lastId, recoverFrom);
+        } else {
+          recoverFrom = lastId; // nothing between the cursor and the newest held id
+        }
+        if (missed.length < 200) return;
+      }
+    })().catch(() => {}); // a failed page leaves the cursor behind; the next live event or reconnect retries
   }
 
   async function switchChannel(name) {
     historyGen++; // anything in flight for the old channel is now stale
+    recoverRun++; // an old recovery loop stops at its next page boundary
     current = name;
     lastId = 0;
+    recoverFrom = 0;
     log.textContent = "";
     exitSearch();
     $("#ch-name").textContent = "#" + name;
@@ -310,13 +369,15 @@ function initChat() {
     es.addEventListener("message", (e) => {
       const m = JSON.parse(e.data);
       if (m.type !== "message" || m.channel !== current) return;
-      const gap = Number(m.id) > lastId + 1; // something was missed mid-stream
+      const id = Number(m.id);
+      const from = lastId; // recovery must start before any gap this event reveals
+      lastId = Math.max(lastId, id); // the id is held now, rendered or not — a search on screen defers rendering, not recovery
+      if (id > from + 1) startRecovery(current, from); // fetch everything that was missed in between
       append(m, m.channel);
-      if (gap) catchUp(current).catch(() => {});
     });
     es.onopen = () => {
       conn.textContent = "live"; conn.classList.add("live");
-      catchUp(current).catch(() => {}); // recover anything missed while away
+      startRecovery(current); // recover anything missed while away
     };
     es.onerror = () => {
       conn.textContent = "reconnecting…"; conn.classList.remove("live");
@@ -370,10 +431,12 @@ function initChat() {
     setError("");
     try {
       const req = await api(`/api/ws/${slug}/pay-test/start`, { method: "POST" });
+      const exact = (Number(req.amountRaw) / 10 ** 6).toFixed(6); // the request's own unique amount
       $("#pay-details").textContent =
-        `TEST payment — ${req.amountUsdc} test-USDC (this is a labelled test, zero revenue; real payments are not accepted yet).\n` +
-        `Send exactly ${req.amountRaw} raw units (${req.amountUsdc} USDC, 6 decimals) of the USDC contract ${req.asset}\n` +
-        `on ${req.chainName} (chain id ${req.chainId}) to ${req.recipient}, then paste the transaction hash below.`;
+        `TEST payment — $12 in test-USDC (this is a labelled test, zero revenue; real payments are not accepted yet).\n` +
+        `Send exactly ${req.amountRaw} raw units = ${exact} test-USDC (6 decimals) of the USDC contract ${req.asset}\n` +
+        `on ${req.chainName} (chain id ${req.chainId}) to ${req.recipient}, then paste the transaction hash below.\n` +
+        `The fraction beyond $12 is this request's own amount: it ties your transfer to this request and no other.`;
       $("#pay-error").textContent = "";
       $("#pay-tx").value = "";
       $("#pay-tx").dataset.intentId = req.intentId;

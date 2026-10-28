@@ -40,7 +40,13 @@ function startServer(dataDir, port) {
   fs.mkdirSync(cwd, { recursive: true });
   // NODE_ENV=test: the strict production storage gate is what deployments
   // exercise, not this check, whose data directories are ordinary temp dirs.
-  const child = spawn(NODE, [path.join(ROOT, "server.js")], {
+  // The server is started under flock(2) exactly as the deployment does: the
+  // shell wrapper takes the exclusive lock and exec's node, so the direct
+  // child holds the kernel data-directory lock itself — a hard kill (SIGKILL)
+  // releases it the moment the process dies, no stale lock, no takeover logic.
+  const lock = require("../lib/lock.js");
+  const cmd = lock.wrapper(dataDir, NODE, [path.join(ROOT, "server.js")]);
+  const child = spawn(cmd.file, cmd.args, {
     cwd,
     env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, NODE_ENV: "test" },
     stdio: ["ignore", "pipe", "pipe"]

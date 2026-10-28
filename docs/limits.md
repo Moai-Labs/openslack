@@ -105,7 +105,13 @@ direction requires. The product enforces these in code (`lib/limits.js`); tests 
 - A workspace can be rebuilt from an export with `node scripts/restore.js
   <export.json>`. The restore command takes exclusive ownership of the data
   directory and refuses to run while the server holds it — a restore against a
-  live server would be overwritten by the server's stale in-memory state.
+  live server would be overwritten by the server's stale in-memory state. The
+  ownership is an OS-backed advisory lock (`flock`): the kernel grants it to
+  exactly one process and drops it the moment that process dies, so there is
+  no stale lock file, no pid to misread, and a crashed server never blocks a
+  recovery. A shutdown, in turn, waits for every in-flight request to finish
+  (or aborts it) before the process exits, so the store is never handed over
+  mid-write.
 - **Membership recovery is administrator-controlled.** A handle is a public
   identifier, not proof of identity, so signing up (or signing in) with a
   handle from an export grants no access to a restored workspace. Every
@@ -116,10 +122,21 @@ direction requires. The product enforces these in code (`lib/limits.js`); tests 
       node scripts/restore.js export.json --attach alice=alice --attach bob=bob
 
   (left side: the handle in the export; right side: an account that already
-  exists in the store). The first attached owner becomes the workspace owner.
-  Pending records are kept until they are attached this way; nothing expires
-  them and nothing else can attach them — the capability exists only in the
-  restore command, never in the HTTP API.
+  exists in the store). The first attached owner becomes the workspace owner —
+  also when the verified account has already joined the workspace by
+  invitation, in which case its membership is promoted. Conflicting or
+  many-to-one mappings are refused before anything is written. Importing and
+  attaching are separate operations: the command refuses to import when any
+  workspace already uses the export's slug (an unrelated workspace with the
+  same name is never mistaken for a restore), and a second run attaches only
+  to a workspace that verifiably records this export as its origin — or to an
+  explicit `--into <slug>` target the administrator names. Pending records are
+  kept until they are attached this way; nothing expires them and nothing else
+  can attach them — the capability exists only in the restore command, never
+  in the HTTP API. Pending members show in the member list as "awaiting
+  recovery", appear in exports (so a partially recovered workspace can be
+  re-exported without losing them), and a failed attachment — for instance
+  into a full workspace — leaves the pending record in place.
 - Deleting a workspace removes its channels, membership, invites and messages from the
   server immediately; this cannot be undone (keep an export first).
 

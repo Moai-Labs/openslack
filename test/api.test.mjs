@@ -5,6 +5,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
+import { spawn, execFileSync } from "node:child_process";
+
+const ROOT_SERVER = path.join(path.dirname(new URL(import.meta.url).pathname), "..");
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-api-"));
 process.env.PORT = "0";
@@ -266,6 +269,318 @@ test("a channel created after its workspace was deleted is rejected, with no orp
   const db = dbOnDisk();
   assert.equal(db.workspaces.some((w) => w.slug === ws.slug), false);
   assert.equal(db.channels.some((c) => c.name === "ghost-channel"), false, "no orphan channel in memory or on disk");
+});
+
+test("the restore command never mistakes an unrelated workspace for a restore of the same slug", async () => {
+  const { Store } = await import("../lib/store.js");
+  const runRestore = (dataDir, args) => {
+    try {
+      return {
+        code: 0,
+        out: execFileSync(process.execPath, [path.join(ROOT_SERVER, "scripts", "restore.js"), ...args], {
+          env: { ...process.env, DATA_DIR: dataDir },
+          encoding: "utf8",
+          timeout: 20000
+        })
+      };
+    } catch (err) {
+      return { code: err.status, out: String(err.stdout || ""), err: String(err.stderr || err.message) };
+    }
+  };
+  const exportBody = (slug) => JSON.stringify({
+    format: "openslack-export-v1",
+    exportedAt: "2026-10-27T12:00:00.000Z",
+    workspace: { slug, name: "Collide", ownerId: "u1", createdAt: "2026-10-01T00:00:00.000Z" },
+    members: [{ handle: "alice", role: "owner", joinedAt: null }],
+    channels: [{ name: "general", topic: "", createdAt: "2026-10-01T00:00:00.000Z" }],
+    messages: [{ id: "1", channel: "general", handle: "alice", text: "from the export", at: "2026-10-02T00:00:00.000Z" }]
+  });
+
+  // An unrelated workspace already holds the export's slug.
+  const collDir = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-restore-collide-"));
+  const pre = new Store(collDir).init();
+  const owner = pre.createUser("stranger", "longenough1");
+  pre.createWorkspace(owner, "Collide"); // takes the slug "collide"
+  const dbBefore = fs.readFileSync(path.join(collDir, "db.json"), "utf8");
+  const logBefore = fs.readFileSync(path.join(collDir, "messages.jsonl"), "utf8");
+
+  const expFile = path.join(os.tmpdir(), `openslack-collide-export-${process.pid}.json`);
+  fs.writeFileSync(expFile, exportBody("collide"));
+  const refused = runRestore(collDir, [expFile]);
+  assert.equal(refused.code, 1, "the collision is refused, not silently ignored");
+  assert.match(refused.err, /Refusing to guess|already exists/, refused.err.slice(0, 200));
+  assert.equal(fs.readFileSync(path.join(collDir, "db.json"), "utf8"), dbBefore, "the unrelated workspace is untouched");
+  assert.equal(fs.readFileSync(path.join(collDir, "messages.jsonl"), "utf8"), logBefore, "no messages were imported behind the refusal");
+
+  // --into names an explicit target: the operator's call, the command proceeds.
+  const into = runRestore(collDir, [expFile, "--into", "collide", "--attach", "alice=stranger"]);
+  assert.equal(into.code, 1, "attaching to a workspace with no such pending record is refused, not guessed");
+  assert.match(into.err, /No pending member/, into.err.slice(0, 200));
+
+  // A free slug imports normally; a second run of the same export attaches.
+  const fresh = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-restore-fresh-"));
+  const first = runRestore(fresh, [expFile]);
+  assert.equal(first.code, 0, first.err && first.err.slice(0, 200));
+  assert.match(first.out, /restored:/);
+  const second = runRestore(fresh, [expFile, "--attach", "alice=alice2"]);
+  assert.equal(second.code, 1, "the verified account must exist first");
+  assert.match(second.err, /no account/);
+  const mk = new Store(fresh).init();
+  mk.createUser("alice2", "longenough1");
+  const third = runRestore(fresh, [expFile, "--attach", "alice=alice2"]);
+  assert.equal(third.code, 0, third.err && third.err.slice(0, 200));
+  assert.match(third.out, /attached:/, "the recorded restoration identity admits the second run as an attach");
+  const store = new Store(fresh).init();
+  const ws = store.workspaceBySlug("collide");
+  assert.equal(store.workspaceBySlug("collide").ownerId, store.db.users.find((u) => u.handle === "alice2").id, "the attached owner owns the workspace");
+  assert.equal(ws.pendingMembers, undefined, "the pending record is consumed");
+  fs.rmSync(expFile, { force: true });
+});
+
+// A stream is only as authenticated as the session that opened it.
+const until = async (fn, what, timeoutMs = 3000) => {
+  const start = Date.now();
+  for (;;) {
+    if (await fn()) return;
+    if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting: ${what}`);
+    await new Promise((r) => setTimeout(r, 25));
+  }
+};
+
+test("logging out ends a stream's live delivery; another session keeps receiving", async () => {
+  // The signup must survive a stale pooled socket (the previous test's long
+  // execFileSync subprocesses idle out the keep-alive connections): one fresh
+  // connection is enough, like a real browser's silent retry.
+  const make = async (handle) => {
+    let r;
+    try {
+      r = await call("POST", "/api/signup", { handle, password: "longenough1" });
+    } catch {
+      r = await call("POST", "/api/signup", { handle, password: "longenough1" });
+    }
+    return cookieOf(r.res);
+  };
+  const owner = await make("streamowner");
+  const leaver = await make("streamleaver");
+  const ws = (await call("POST", "/api/workspaces", { name: "Stream Auth" }, owner)).body;
+  const inv = (await call("POST", "/api/invites", { slug: ws.slug }, owner)).body;
+  assert.equal((await call("POST", `/api/invites/${inv.token}/join`, null, leaver)).res.status, 200);
+
+  const openStream = async (cookie) => {
+    const res = await fetch(`http://127.0.0.1:${port}/api/ws/${ws.slug}/stream`, { headers: { cookie } });
+    assert.equal(res.headers.get("content-type"), "text/event-stream");
+    const state = { events: [], ended: false };
+    (async () => {
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) {
+            state.ended = true;
+            return;
+          }
+          const buf = (state._buf = (state._buf || "") + dec.decode(value, { stream: true }));
+          let i;
+          while ((i = buf.indexOf("\n\n")) >= 0) {
+            const chunk = buf.slice(0, i);
+            state._buf = buf.slice(i + 2);
+            if (chunk.startsWith("event: message")) state.events.push(JSON.parse(chunk.split("data: ")[1]));
+          }
+          state._reader = reader;
+        }
+      } catch {
+        state.ended = true;
+      }
+    })();
+    await new Promise((r) => setTimeout(r, 150)); // let the server register the stream
+    return state;
+  };
+
+  const stay = await openStream(owner);
+  const gone = await openStream(leaver);
+  await call("POST", `/api/ws/${ws.slug}/channels/general/messages`, { text: "before logout" }, owner);
+  await until(() => stay.events.some((e) => e.text === "before logout") && gone.events.some((e) => e.text === "before logout"), "both streams delivered");
+
+  // Logging out must terminate that session's stream — not the other's.
+  assert.equal((await call("POST", "/api/logout", null, leaver)).res.status, 200);
+  await until(() => gone.ended, "the logged-out stream is terminated");
+  assert.equal(stay.ended, false, "the other session's stream is untouched");
+
+  await call("POST", `/api/ws/${ws.slug}/channels/general/messages`, { text: "after logout" }, owner);
+  await until(() => stay.events.some((e) => e.text === "after logout"), "the valid session still receives");
+  await new Promise((r) => setTimeout(r, 150));
+  assert.ok(!gone.events.some((e) => e.text === "after logout"), "the logged-out session received nothing more");
+
+  // And the logged-out session really is gone: the API refuses it.
+  assert.equal((await call("GET", `/api/ws/${ws.slug}`, null, leaver)).res.status, 401);
+  if (stay._reader) stay._reader.cancel().catch(() => {});
+});
+
+test("an expired session's stream is terminated by broadcast and heartbeat, without being refreshed", async () => {
+  const { Store } = await import("../lib/store.js");
+  const { Api } = await import("../lib/api.js");
+  const { default: LIMITS } = await import("../lib/limits.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-streamauth-"));
+  const store = new Store(dir).init();
+  const u1 = store.createUser("streamer", "longenough1");
+  const u2 = store.createUser("bystander", "longenough1");
+  const t1 = store.createSession(u1.id);
+  const t2 = store.createSession(u2.id);
+  const ws = store.createWorkspace(u1, "Stream Expiry");
+  store.joinWorkspace(ws, u2);
+
+  // Fake SSE responses: writes are recorded, end() is observable.
+  const fakeRes = () => ({ writes: [], ended: false, write(c) { this.writes.push(c); }, end() { this.ended = true; } });
+  const s1 = { res: fakeRes(), wsId: ws.id, userId: u1.id, token: t1 };
+  const s2 = { res: fakeRes(), wsId: ws.id, userId: u2.id, token: t2 };
+  const api = new Api(store);
+  api.streams.add(s1);
+  api.streams.add(s2);
+
+  api.broadcast(ws.id, { type: "message", text: "one" });
+  assert.ok(s1.res.writes.some((w) => w.includes("one")), "a valid session receives live messages");
+  assert.ok(s2.res.writes.some((w) => w.includes("one")));
+
+  // The session expires (idle past the published lifetime): broadcast must
+  // deliver nothing further and terminate the stream.
+  const sess = store.db.sessions.find((x) => x.token === t1);
+  sess.lastSeen = new Date(Date.now() - (LIMITS.SESSION_DAYS + 1) * 86400000).toISOString();
+  api.broadcast(ws.id, { type: "message", text: "two" });
+  assert.ok(!s1.res.writes.some((w) => w.includes("two")), "an expired session receives nothing");
+  assert.equal(s1.res.ended, true, "the expired stream is terminated");
+  assert.ok(!api.streams.has(s1));
+
+  // Periodic maintenance ends expired streams too, and never refreshes
+  // session activity merely by pinging.
+  api.heartbeat();
+  assert.ok(!s1.res.writes.some((w) => w.includes("ping")));
+  assert.equal(store.db.sessions.find((x) => x.token === t1).lastSeen, sess.lastSeen, "heartbeat did not refresh the expired session");
+
+  // The valid session keeps receiving across all of it.
+  api.broadcast(ws.id, { type: "message", text: "three" });
+  assert.ok(s2.res.writes.some((w) => w.includes("three")), "the valid session is unaffected");
+  assert.equal(s2.res.ended, false);
+
+  // Logout removes the session and its stream with it.
+  store.dropSession(t2);
+  api.endStreamsFor(t2);
+  assert.equal(s2.res.ended, true, "logout terminates the stream");
+  assert.ok(!api.streams.has(s2));
+});
+
+test("shutdown holds the data directory until in-flight requests finish", async () => {
+  // A server started exactly as the deployment does: under flock, holding the
+  // exclusive lock for its lifetime. SIGTERM must not hand the directory to a
+  // restore while a mutation request is still being received.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-shutdown-"));
+  const port = 19000 + Math.floor(Math.random() * 500);
+  const lock = await import("../lib/lock.js");
+  const start = (p) => {
+    const cmd = lock.wrapper(dir, process.execPath, [path.join(ROOT_SERVER, "server.js")]);
+    return spawn(cmd.file, cmd.args, {
+      cwd: fs.mkdtempSync(path.join(os.tmpdir(), "openslack-shutdown-cwd-")),
+      env: { ...process.env, PORT: String(p), DATA_DIR: dir, NODE_ENV: "test" },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+  };
+  const child = start(port);
+  let childOut = "";
+  child.stdout.on("data", (d) => (childOut += d));
+  child.stderr.on("data", (d) => (childOut += d));
+  const exited = new Promise((resolve) => child.on("exit", (code) => resolve(code)));
+  try {
+    for (let i = 0; i < 100; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/healthz`);
+        if (res.ok) break;
+      } catch {}
+      if (i === 99) throw new Error(`child server did not start: ${childOut.slice(0, 300)}`);
+    }
+
+    const signup = await fetch(`http://127.0.0.1:${port}/api/signup`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ handle: "drainer", password: "longenough1" })
+    });
+    const cookie = (signup.headers.get("set-cookie") || "").split(";")[0];
+    const ws = await (
+      await fetch(`http://127.0.0.1:${port}/api/workspaces`, {
+        method: "POST",
+        headers: { "content-type": "application/json", cookie },
+        body: JSON.stringify({ name: "Drain" })
+      })
+    ).json();
+
+    // A mutation request whose body is only partly received: the server has
+    // the headers, the message is not yet written.
+    const body = JSON.stringify({ text: "posted during shutdown" });
+    const req = http.request({
+      host: "127.0.0.1",
+      port,
+      path: `/api/ws/${ws.slug}/channels/general/messages`,
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, "content-length": String(body.length) }
+    });
+    req.write(body.slice(0, 5));
+    req.on("error", () => {}); // a destroyed socket is handled at the await below
+    await new Promise((r) => setTimeout(r, 300)); // let the server take the request in
+
+    child.kill("SIGTERM"); // graceful shutdown: it must wait for this request
+    await new Promise((r) => setTimeout(r, 300));
+
+    // While the request is still open, the directory is still owned.
+    let refused = null;
+    try {
+      execFileSync(process.execPath, [path.join(ROOT_SERVER, "scripts", "restore.js"), path.join(os.tmpdir(), `no-such-export-${process.pid}.json`)], {
+        env: { ...process.env, DATA_DIR: dir },
+        encoding: "utf8",
+        timeout: 10000
+      });
+    } catch (err) {
+      refused = err;
+    }
+    assert.ok(refused, "restore must be refused while the server drains");
+    assert.match(String(refused.stderr), /owned by another live process/, String(refused.stderr).slice(0, 200));
+
+    // Finish the request: the server completes it, then exits, then the
+    // directory is free.
+    const res = await new Promise((resolve, reject) => {
+      req.on("response", resolve);
+      req.on("error", reject);
+      req.end(body.slice(5));
+    });
+    assert.equal(res.statusCode, 201, "the in-flight mutation completes during the drain");
+    res.resume();
+    assert.equal(await exited, 0, "the server exits once nothing can write");
+
+    // The directory is free again, and the message made it to disk.
+    const again = start(port + 1);
+    let restarted = false;
+    for (let i = 0; i < 100 && !restarted; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      try {
+        const res2 = await fetch(`http://127.0.0.1:${port + 1}/healthz`);
+        if (res2.ok) restarted = true;
+      } catch {}
+    }
+    assert.ok(restarted, "a new server acquires the freed directory");
+    const login = await fetch(`http://127.0.0.1:${port + 1}/api/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ handle: "drainer", password: "longenough1" })
+    });
+    const cookie2 = (login.headers.get("set-cookie") || "").split(";")[0];
+    const history = await (
+      await fetch(`http://127.0.0.1:${port + 1}/api/ws/${ws.slug}/channels/general/messages`, { headers: { cookie: cookie2 } })
+    ).json();
+    assert.ok((history.messages || []).some((m) => m.text === "posted during shutdown"), "the drained mutation persisted");
+    again.kill("SIGTERM");
+  } finally {
+    child.kill("SIGKILL");
+    await Promise.race([exited, new Promise((r) => setTimeout(r, 1000))]);
+  }
 });
 
 test("server shuts down cleanly", async () => {

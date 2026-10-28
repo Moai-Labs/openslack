@@ -7,8 +7,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { Store } = require("./lib/store");
 const { Api, sendJson } = require("./lib/api");
-const { acquire } = require("./lib/lock");
-const { isSeparateMount } = require("./lib/durable");
+const lock = require("./lib/lock");
+const { inspectStorage } = require("./lib/storage");
 const pages = require("./lib/pages");
 const LIMITS = require("./lib/limits");
 
@@ -19,57 +19,116 @@ const isProduction = process.env.NODE_ENV === "production";
 // deployed image it is the mounted volume named by DATA_DIR (deploy.json).
 // Writability alone proves nothing — a container-local path is writable and
 // still loses every message at the next deploy — so durability is claimed
-// only for a writable path on a separate mount, and a deployment that cannot
-// provide one refuses to start rather than quietly accepting private data it
-// cannot keep.
+// only for a writable path on the volume's own filesystem (see
+// lib/storage.js), and a deployment that cannot provide one refuses to serve
+// private data rather than quietly accepting data it cannot keep.
 function resolveDataDir() {
   const wanted = process.env.DATA_DIR;
   if (wanted) {
-    const probe = path.join(wanted, `.write-probe-${process.pid}`);
     try {
       fs.mkdirSync(wanted, { recursive: true });
-      fs.writeFileSync(probe, "ok");
-      fs.unlinkSync(probe);
-      const durable = isSeparateMount(wanted);
-      if (!durable) {
-        const message = `${wanted} is writable but on the container's own filesystem, so nothing written there survives a redeploy.`;
-        if (isProduction) {
-          console.error(`refusing to start: ${message} Mount the persistent volume there.`);
-          process.exit(1);
-        }
-        console.warn(`warning: ${message} /healthz will report storage.durable=false.`);
-      }
-      return { dir: wanted, durable };
     } catch (err) {
-      const message = `DATA_DIR ${wanted} is not usable: ${err.message}`;
+      const message = `DATA_DIR ${wanted} cannot be created: ${err.message}`;
       if (isProduction) {
-        console.error(`refusing to start: ${message} Check the volume mount and the node user's write permission.`);
-        process.exit(1);
+        return { dir: wanted, durable: false, refusal: `${message} Check the volume mount and the node user's write permission.` };
       }
       console.error(`${message}; falling back to local storage.`);
+      return { dir: path.join(process.cwd(), "data"), durable: false };
     }
-  } else if (isProduction) {
-    console.error("refusing to start: DATA_DIR is not set; without it messages live on the container's own filesystem and a redeploy loses them.");
-    process.exit(1);
+    const probe = path.join(path.resolve(wanted), `.write-probe-${process.pid}`);
+    let writable = false;
+    let writeError = "";
+    try {
+      fs.writeFileSync(probe, "ok");
+      fs.unlinkSync(probe);
+      writable = true;
+    } catch (err) {
+      writeError = err.message;
+    }
+    const verdict = writable ? inspectStorage(wanted) : { durable: false, reason: `not writable by this user (${writeError})` };
+    if (verdict.durable) return { dir: path.resolve(wanted), durable: true };
+    const message = `DATA_DIR ${wanted} is ${verdict.reason}, so nothing written there is guaranteed to survive a redeploy.`;
+    if (isProduction) {
+      return { dir: path.resolve(wanted), durable: false, refusal: `${message} Mount the persistent volume there.` };
+    }
+    console.warn(`warning: ${message} /healthz will report storage.durable=false.`);
+    return { dir: path.resolve(wanted), durable: false };
+  }
+  if (isProduction) {
+    return { dir: null, durable: false, refusal: "DATA_DIR is not set; without it messages live on the container's own filesystem and a redeploy loses them." };
   }
   const local = path.join(process.cwd(), "data");
   fs.mkdirSync(local, { recursive: true });
   return { dir: local, durable: false };
 }
 
-const { dir: dataDir, durable } = resolveDataDir();
+// A production start that cannot verify durable storage never opens the
+// store — but it must not vanish, either: a process that just exits leaves
+// the deployment's machine accepting connections and answering nothing,
+// which is undiagnosable from outside (exactly the state a deployed refusal
+// once produced). Instead it binds the port and serves exactly one thing:
+// the verdict. /healthz answers 503 with durable:false and the refusal
+// reason, every other route answers 503. No store is opened and the data
+// directory is not touched, so nothing private can be read or written — the
+// refusal stays as loud as before, and is now readable, until the volume is
+// mounted properly and the deployment restarts.
+function startDegraded(reason) {
+  const server = http.createServer((req, res) => {
+    res.setHeader("x-content-type-options", "nosniff");
+    res.setHeader("content-security-policy", "default-src 'self'; frame-ancestors 'none'");
+    let p = "/";
+    try {
+      p = decodeURIComponent(new URL(req.url, "http://x").pathname);
+    } catch {
+      /* answered below */
+    }
+    const verdict = JSON.stringify({ ok: false, durable: false, reason: `not serving: ${reason}` });
+    if (req.method === "GET" && p === "/healthz") {
+      res.writeHead(503, { "content-type": "application/json", "cache-control": "no-store" });
+      return res.end(verdict);
+    }
+    res.writeHead(503, { "content-type": "application/json", "cache-control": "no-store", "retry-after": "300" });
+    res.end(verdict);
+  });
+  server.listen(PORT, () => {
+    console.error(`degraded: serving the storage refusal on ${PORT} until the persistent volume is mounted properly`);
+  });
+  const stop = () => {
+    if (server.closeAllConnections) server.closeAllConnections();
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 1000).unref();
+  };
+  process.on("SIGTERM", stop);
+  process.on("SIGINT", stop);
+  return server;
+}
+
+const resolved = resolveDataDir();
+if (resolved.refusal) {
+  console.error(`refusing to serve private data: ${resolved.refusal}`);
+  module.exports = startDegraded(resolved.refusal);
+  return;
+}
+const { dir: dataDir, durable } = resolved;
 
 // One owner per data directory: a restore run against a live server would be
-// overwritten by the server's stale in-memory state on its next save.
-//
-// This process holds the OS flock itself, for its entire life, so there is no
-// loss to watch for while we run: the kernel frees the directory only when we
-// die or release() it, and killing any other process cannot free it. A
-// restart takes the lock again before serving anything. release() during our
-// own SIGTERM shutdown is an intentional release.
-let dirLock;
+// overwritten by the server's stale in-memory state on its next save. The
+// exclusivity is an OS-backed flock(2) held for this process's lifetime; a
+// process started outside flock (npm start) re-runs itself under it first.
+// require.main keeps the module importable: the test suite starts the server
+// in-process, where acquire() verifies no live owner instead.
+lock.watchSupervisor(); // no-op unless a flock supervisor launched us
+if (require.main === module && !lock.alreadyHeld(dataDir)) {
+  try {
+    lock.runUnderLock(dataDir, "server");
+  } catch (err) {
+    console.error(`refusing to start: ${err.message}`);
+    process.exit(1);
+  }
+  return; // this process is now only the supervisor; the child serves
+}
 try {
-  dirLock = acquire(dataDir, "server");
+  lock.acquire(dataDir, "server");
 } catch (err) {
   console.error(`refusing to start: ${err.message}`);
   process.exit(1);
@@ -82,18 +141,22 @@ const api = new Api(store, (req) => {
   return `${proto}://${host}`;
 }, { durable });
 
+// Requests in flight, counted from when the server sees them until the
+// response is finished or the socket is gone. Shutdown waits for this to hit
+// zero: the process holds the data directory's exclusive lock, and exiting
+// while a mutation request is still being received would release the store to
+// a restore mid-write.
+let inFlight = 0;
+let shuttingDown = false;
+
 const publicDir = path.join(__dirname, "public");
 const staticFiles = new Map(
   ["app.js", "style.css"].map((f) => ["/" + f, { file: path.join(publicDir, f), type: f.endsWith(".css") ? "text/css; charset=utf-8" : "text/javascript; charset=utf-8" }])
 );
 
 const server = http.createServer(async (req, res) => {
-  // After release() — our own SIGTERM teardown — refuse everything rather
-  // than serve (and write) while the directory is up for grabs. While the
-  // process lives and has not released, it owns the directory outright.
-  if (!dirLock.alive()) {
-    return sendJson(res, 503, { error: "The server has lost exclusive ownership of its data directory and is shutting down." });
-  }
+  inFlight++; // every request counts until its response is done or aborted
+  res.on("close", () => inFlight--);
   res.setHeader("x-content-type-options", "nosniff");
   res.setHeader("referrer-policy", "no-referrer");
   res.setHeader("content-security-policy", "default-src 'self'; frame-ancestors 'none'");
@@ -146,14 +209,30 @@ beat.unref();
 sweep.unref();
 
 server.listen(PORT, () => {
-  console.log(`listening on ${server.address().port}, data in ${dataDir} (${durable ? "persistent volume" : "NOT durable: local storage"})`);
+  console.log(`listening on ${PORT}, data in ${dataDir} (${durable ? "persistent volume" : "NOT durable: local storage"})`);
 });
 
+// Stop accepting requests and finish or abort every in-flight one BEFORE the
+// process exits: only the exit drops the exclusive lock, so exiting early
+// would hand the data directory to a restore while a mutation is mid-flight.
+// The flock-based ownership is released by the kernel at process death —
+// there is no lock file to unlink earlier, and none is.
 async function shutdown() {
-  api.closeAll();
-  dirLock.release();
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 2000).unref();
+  if (shuttingDown) return;
+  shuttingDown = true;
+  api.closeAll(); // SSE responses never carry writes; end them now
+  server.close(); // refuse new connections and requests
+  // A generous ceiling: the drain exists so a slow client cannot be cut off
+  // mid-mutation, so it must comfortably outlast a request that took seconds
+  // to deliver its body — not add a new way to lose one.
+  const deadline = Date.now() + 10000;
+  const wait = setInterval(() => {
+    if (inFlight <= 0 || Date.now() > deadline) {
+      clearInterval(wait);
+      server.closeAllConnections(); // idle keep-alive sockets
+      process.exit(0); // the kernel drops the advisory lock here, not before
+    }
+  }, 25);
 }
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);

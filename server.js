@@ -70,9 +70,24 @@ const { dir: dataDir, durable } = resolveDataDir();
 
 // One owner per data directory: a restore run against a live server would be
 // overwritten by the server's stale in-memory state on its next save.
+//
+// The lock can also be LOST while we run: if the holder process dies without
+// a release() — an OOM kill, an operator's stray signal — the kernel frees
+// the directory at that moment and another process may take it while our
+// in-memory state is still live. From that point every write we make risks
+// clobbering the new owner's data, so we fail closed: refuse requests, drop
+// the live streams and exit, and let the deployment restart us (a restart
+// takes the lock again before serving anything). release() during our own
+// SIGTERM shutdown is an intentional release and reports nothing.
 let dirLock;
 try {
-  dirLock = acquire(dataDir, "server");
+  dirLock = acquire(dataDir, "server", {
+    onLost: () => {
+      console.error("FATAL: the data-directory lock was lost unexpectedly; stopping all writes and exiting so the new owner's data cannot be clobbered. The deployment will restart this server.");
+      api.closeAll();
+      process.exit(1);
+    }
+  });
 } catch (err) {
   console.error(`refusing to start: ${err.message}`);
   process.exit(1);
@@ -91,6 +106,12 @@ const staticFiles = new Map(
 );
 
 const server = http.createServer(async (req, res) => {
+  // A lost lock is worse than a slow server: refuse everything rather than
+  // serve (and write) beside a new owner of the directory. alive() also
+  // catches a holder death in the moments before its exit event lands.
+  if (dirLock.lost || !dirLock.alive()) {
+    return sendJson(res, 503, { error: "The server has lost exclusive ownership of its data directory and is shutting down." });
+  }
   res.setHeader("x-content-type-options", "nosniff");
   res.setHeader("referrer-policy", "no-referrer");
   res.setHeader("content-security-policy", "default-src 'self'; frame-ancestors 'none'");

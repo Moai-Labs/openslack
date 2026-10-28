@@ -53,7 +53,17 @@ for (let i = 0; i < argv.length; i++) {
 
 let dirLock;
 try {
-  dirLock = acquire(resolveDataDir(), "restore");
+  dirLock = acquire(resolveDataDir(), "restore", {
+    // An unexpected loss (the holder dying without a release) means another
+    // process can own the directory while this script is mid-restore. The
+    // rewrite must not continue beside a new owner: abort loudly at once.
+    // release() in the finally block below is an intentional release and
+    // reports nothing.
+    onLost: () => {
+      console.error("FATAL: the data-directory lock was lost unexpectedly; aborting the restore so the new owner's data cannot be clobbered.");
+      process.exit(1);
+    }
+  });
 } catch (err) {
   console.error(err instanceof LockError ? err.message : err);
   console.error("restore refuses to touch a data directory that a running server owns:");
@@ -62,6 +72,10 @@ try {
 }
 
 try {
+  // The rewrite below is one synchronous block — nothing can interleave with
+  // it — but the holder dying just before it starts would leave us writing
+  // beside a new owner, so the liveness is re-checked on the spot.
+  if (!dirLock.alive()) throw new Error("the data-directory lock was lost before the restore could start; nothing was written");
   const store = new Store(resolveDataDir()).init();
   const exported = JSON.parse(fs.readFileSync(file, "utf8"));
 

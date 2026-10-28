@@ -100,3 +100,41 @@ Review round 2 of 5 on post-18 at 6c6cb15 asked for two changes; both are made
 Session note: the first rewrite of the lock made acquire() async, which broke
 the tests' in-process `import("../server.js").default` contract and hung the
 suite; reverted to the synchronous handshake above instead of restructure.
+
+## 2026-10-28 (session 5)
+
+Review round 3 of 5 on post-18 at 402be1b asked for two changes; both are made
+(tests 69/69, persistence check 29/29):
+
+- lib/lock.js: the holder chain's death while its owner lives is now watched.
+  The holder publishes its pid in the handshake marker; the owner attaches an
+  exit handler on its wrapper and, when the chain exits without release(),
+  reports the lock as LOST to the owner through an onLost callback, force-ends
+  any survivor of the group so "lost" always means the flock is really gone,
+  and exposes alive() — one synchronous kill(holderPid, 0) — so a caller about
+  to write can refuse even in the moments before the exit event lands.
+  release() marks itself intentional first, so a normal teardown (SIGTERM
+  shutdown, a script finishing) is never reported as a loss. Wiring:
+  server.js fails closed on loss (FATAL log, SSE streams closed, process exit
+  1 — the deployment restarts it and it re-acquires before serving) and
+  returns 503 to anything arriving between holder death and exit-event
+  delivery; scripts/restore.js aborts loudly on loss and re-checks liveness
+  immediately before its synchronous rewrite. Tests: an intentional release
+  is never a loss; killing the holder alone makes the owner report the loss
+  exactly once before a second owner acquires; and a real writing child (a
+  process that appends while it owns the lock) stops writing at the holder's
+  death and writes nothing under the new owner. Verified by hand too: a
+  server whose holder is SIGKILLed logs FATAL and exits 1, a SIGTERMed server
+  exits without any loss report, and the next server takes the directory
+  immediately.
+- lib/api.js: the message POST and channel POST routes resolved the workspace
+  and channel and checked membership BEFORE awaiting the body, so a request
+  whose body stays pending while another request deletes the workspace would
+  run postMessage()/createChannel() on stale objects — an acknowledged orphan
+  message appended to disk, an orphan channel, a broadcast to live streams.
+  Both routes now read the body first and re-resolve the workspace, recheck
+  membership and re-find the channel immediately before the synchronous
+  mutation; the pay-test/confirm route got the same treatment (same
+  pending-body pattern). Tests park a real request with headers only, delete
+  the workspace mid-body, finish the body, and assert a 404 with no orphan
+  message in messages.jsonl and no ghost channel in db.json.

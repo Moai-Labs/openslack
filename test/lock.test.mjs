@@ -125,6 +125,122 @@ test("ownership lasts until release, and release is safe to repeat", () => {
   acquireEventually(dir).release(); // must not throw
 });
 
+// A child that owns the lock AND writes to a file while it does — the real
+// shape of a server. On unexpected lock loss it must stop writing: first the
+// synchronous liveness check, then the loss callback, whichever lands first.
+const CHILD_WRITER = `
+const fs = require("node:fs");
+const { acquire } = require(${JSON.stringify(new URL("../lib/lock.js", import.meta.url).pathname)});
+let stopped = false;
+const lock = acquire(process.argv[2], "writer", {
+  onLost: () => {
+    if (!stopped) { stopped = true; console.log("LOST"); }
+  }
+});
+console.log("WON " + lock.holderPid);
+const timer = setInterval(() => {
+  if (stopped || !lock.alive()) {
+    if (!stopped) { stopped = true; console.log("LOST"); }
+    clearInterval(timer);
+    return;
+  }
+  fs.appendFileSync(process.argv[3], "w\\n");
+}, 20);
+setTimeout(() => process.exit(0), 30000); // stay alive for the test to watch
+`;
+
+// Runs the writing child and lets the test wait for its next line.
+function runWriter(dir, file) {
+  const child = execFile(process.execPath, ["-e", CHILD_WRITER, "writer", dir, file]);
+  const lines = [];
+  const wait = (prefix, ms = 10000) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timeout waiting for "${prefix}"; saw: ${lines.join(" | ") || "nothing"}`)), ms);
+      const check = () => {
+        const hit = lines.find((l) => l.startsWith(prefix));
+        if (hit) {
+          clearTimeout(timer);
+          resolve(hit);
+        }
+      };
+      child.stdout.on("data", (c) => {
+        for (const l of c.toString().split("\n")) if (l.trim()) lines.push(l.trim());
+        check();
+      });
+      check();
+    });
+  return { child, wait };
+}
+
+test("an intentional release is never reported as a loss", async () => {
+  const dir = freshDir();
+  const losses = [];
+  const lock = acquire(dir, "owner", { onLost: (why) => losses.push(why) });
+  lock.release(); // the owner chose to let go
+  acquireEventually(dir).release(); // the directory is free for the next owner
+  // Give the wrapper's exit event its moment: it must not surface as a loss.
+  await new Promise((r) => setTimeout(r, 200));
+  assert.deepEqual(losses, [], "release() is an intentional release, not an unexpected loss");
+  assert.equal(lock.lost, false);
+});
+
+test("killing the holder while its owner stays alive fails the owner closed before another owner acquires", async () => {
+  const dir = freshDir();
+  const losses = [];
+  const lock = acquire(dir, "owner", { onLost: (why) => losses.push(why) });
+  assert.equal(lock.alive(), true, "the holder is alive while the lock is held");
+  assert.ok(lock.holderPid > 0, "the owner knows the holder it depends on");
+
+  // Kill the HOLDER alone; the owner process keeps running.
+  process.kill(lock.holderPid, "SIGKILL");
+  const deadline = Date.now() + 5000;
+  while (!lock.lost && Date.now() < deadline) await new Promise((r) => setImmediate(r));
+  assert.equal(lock.lost, true, "the owner learned of the unexpected loss");
+  assert.match(lock.lossReason, /lost unexpectedly/);
+  assert.equal(losses.length, 1, "the loss was reported exactly once");
+  assert.equal(lock.alive(), false, "the synchronous check refuses to vouch for a dead holder");
+
+  // Only after the first owner has failed closed does a second owner take
+  // the directory — the first owner's handle reports lost, its callback has
+  // run, and nothing of it is mid-write.
+  const second = acquireEventually(dir);
+  lock.release(); // must not surface as a second loss
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(losses.length, 1, "an intentional release after a loss is not another loss");
+  second.release();
+});
+
+test("a writing owner stops writing when its holder dies, and writes nothing under the new owner", async () => {
+  const dir = freshDir();
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-writes-"));
+  const file = path.join(scratch, "writes.log");
+  const writer = runWriter(dir, file);
+  const won = await writer.wait("WON");
+  const holderPid = Number(won.split(" ")[1]);
+  assert.ok(holderPid > 0);
+
+  // The owner is writing while it owns the lock.
+  const writesStart = Date.now();
+  while ((!fs.existsSync(file) || fs.readFileSync(file, "utf8").length === 0) && Date.now() - writesStart < 5000) {
+    await new Promise((r) => setImmediate(r));
+  }
+  assert.ok(fs.existsSync(file) && fs.readFileSync(file, "utf8").length > 0, "the owner was writing while it owned the lock");
+
+  // Kill the holder; the owner must stop — synchronously, before the next
+  // write — and report the loss.
+  process.kill(holderPid, "SIGKILL");
+  await writer.wait("LOST");
+  const stoppedAt = fs.readFileSync(file, "utf8");
+
+  // Now a second owner takes the directory. The first owner, failed closed,
+  // must not write a byte under it.
+  const second = acquireEventually(dir);
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(fs.readFileSync(file, "utf8"), stoppedAt, "no write after the loss — the directory belongs to the new owner alone");
+  second.release();
+  writer.child.kill("SIGKILL");
+});
+
 test("two live processes in separate PID namespaces sharing one data directory: exactly one writer", async (t) => {
   // unshare(1) needs user-namespace privileges; where the environment does
   // not grant them this test says so and skips. The mechanism itself reads

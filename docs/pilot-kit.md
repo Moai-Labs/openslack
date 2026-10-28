@@ -7,6 +7,17 @@ Gate review **November 3**; outcome target **November 10**. Today is 2026-10-27.
 
 ## Status and dependencies (honest)
 
+- Updated 2026-10-28 (lane 50, session 1): the pre-invitation proof list is
+  **partially closed with dated evidence** — published limits rechecked (document 1
+  now v2 with the paid-tier section added), and on the live dev preview: private
+  access enforced, free tier at 5 members, ordinary invite → join → chat → fresh-
+  session history → SSE → search → owner export → deletion all verified with
+  synthetic data (~06:04 UTC). A marker workspace
+  (`gate-check-synthetic-post-50-2026-10-28t`, 3 dated messages) is left in place
+  so the **next platform redeploy** can prove storage survives it. Still open
+  before invitations: the team's disposition of paused trust step #16, the
+  redeploy-survival check and a restore on the deployed instance, one willing
+  organiser, and a supported real checkout for the paying-organiser item.
 - Updated 2026-10-28 (session 7): **root cause of the dead deploy found.**
   The production durability check compared `fs.statfsSync(p).dev` — Node's
   statfsSync() result has no `dev` field, so every path looked

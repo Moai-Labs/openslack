@@ -222,7 +222,10 @@ async function shutdown() {
   shuttingDown = true;
   api.closeAll(); // SSE responses never carry writes; end them now
   server.close(); // refuse new connections and requests
-  const deadline = Date.now() + 3000;
+  // A generous ceiling: the drain exists so a slow client cannot be cut off
+  // mid-mutation, so it must comfortably outlast a request that took seconds
+  // to deliver its body — not add a new way to lose one.
+  const deadline = Date.now() + 10000;
   const wait = setInterval(() => {
     if (inFlight <= 0 || Date.now() > deadline) {
       clearInterval(wait);

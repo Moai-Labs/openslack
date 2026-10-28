@@ -34,16 +34,6 @@ await onceReady(port);
 const j = async (r) => ({ status: r.status, body: await r.json().catch(() => ({})) });
 const cookieOf = (r) => (r.headers.get("set-cookie") || "").split(";")[0];
 
-async function until(fn, what, ms = 3000) {
-  const end = Date.now() + ms;
-  for (;;) {
-    const v = await fn();
-    if (v) return v;
-    if (Date.now() > end) throw new Error(`timeout waiting for ${what}`);
-    await new Promise((r) => setTimeout(r, 20));
-  }
-}
-
 async function call(method, p, body, cookie) {
   const res = await fetch(`http://127.0.0.1:${port}${p}`, {
     method,
@@ -194,6 +184,93 @@ test("export, delete, restore path over the API", async () => {
   assert.equal((ws2.pendingMembers || []).map((p) => p.handle).sort().join(","), "guest,member0,member1,member2", "unattached exported members stay pending");
 });
 
+test("pages and static assets are served", async () => {
+  const home = await fetch(`http://127.0.0.1:${port}/`);
+  assert.match(await home.text(), /OpenSlack/);
+  const js = await fetch(`http://127.0.0.1:${port}/app.js`);
+  assert.equal(js.status, 200);
+  const css = await fetch(`http://127.0.0.1:${port}/style.css`);
+  assert.equal(css.status, 200);
+  const joinPage = await fetch(`http://127.0.0.1:${port}/join/abc123`);
+  assert.match(await joinPage.text(), /Join a workspace/);
+  assert.equal((await fetch(`http://127.0.0.1:${port}/w/UPPER`)).status, 404);
+  assert.equal((await call("POST", "/api/nope")).res.status, 404);
+});
+
+// Opens a request whose body is deliberately held back: the server has
+// already resolved the workspace and channel and is parked awaiting the
+// body, which is exactly the window in which another request can delete the
+// workspace. The returned finish() completes the body.
+function pendingRequest(method, p, cookie, body) {
+  let finishBody;
+  const response = new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: "127.0.0.1", port, method, path: p, headers: { cookie, "content-type": "application/json" } },
+      (r) => {
+        let data = "";
+        r.on("data", (c) => (data += c));
+        r.on("end", () => {
+          try {
+            resolve({ status: r.statusCode, body: JSON.parse(data || "{}") });
+          } catch (err) {
+            reject(err);
+          }
+        });
+      }
+    );
+    req.on("error", reject);
+    req.flushHeaders(); // headers only: the server is now waiting in readJson()
+    finishBody = () => req.end(JSON.stringify(body));
+  });
+  return { finish: finishBody, response };
+}
+
+const dbOnDisk = () => JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR, "db.json"), "utf8"));
+const logOnDisk = () => fs.readFileSync(path.join(process.env.DATA_DIR, "messages.jsonl"), "utf8");
+
+test("a message finished after its workspace was deleted is rejected, with no orphan on disk", async () => {
+  const a = cookieOf((await call("POST", "/api/signup", { handle: "stale-owner", password: "longenough1" })).res);
+  const b = cookieOf((await call("POST", "/api/signup", { handle: "stale-member", password: "longenough1" })).res);
+  const ws = (await call("POST", "/api/workspaces", { name: "Stale Body" }, a)).body;
+  const inv = (await call("POST", "/api/invites", { slug: ws.slug }, a)).body;
+  await call("POST", `/api/invites/${inv.token}/join`, null, b);
+
+  // The member opens a message post whose body never arrives; the server
+  // resolves the workspace, checks membership and parks in readJson().
+  const pending = pendingRequest("POST", `/api/ws/${ws.slug}/channels/general/messages`, b, { text: "orphan message" });
+  await new Promise((r) => setTimeout(r, 100));
+  // The owner deletes the workspace while that body is still pending.
+  assert.equal((await call("DELETE", `/api/ws/${ws.slug}`, null, a)).res.status, 200);
+  pending.finish();
+  const out = await pending.response;
+  assert.equal(out.status, 404, "the stale continuation must be rejected");
+  assert.match(out.body.error, /No such workspace/);
+
+  // Nothing was written for the deleted workspace: not on disk, not in a
+  // later viewer's history, and no broadcast could have reached a stream
+  // because the mutation never ran.
+  const db = dbOnDisk();
+  assert.equal(db.workspaces.some((w) => w.slug === ws.slug), false);
+  assert.equal(logOnDisk().includes("orphan message"), false, "no orphan message appended to the log");
+});
+
+test("a channel created after its workspace was deleted is rejected, with no orphan on disk", async () => {
+  const a = cookieOf((await call("POST", "/api/signup", { handle: "stale-owner-2", password: "longenough1" })).res);
+  const ws = (await call("POST", "/api/workspaces", { name: "Stale Channel" }, a)).body;
+
+  const pending = pendingRequest("POST", `/api/ws/${ws.slug}/channels`, a, { name: "ghost-channel" });
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal((await call("DELETE", `/api/ws/${ws.slug}`, null, a)).res.status, 200);
+  pending.finish();
+  const out = await pending.response;
+  assert.equal(out.status, 404, "the stale continuation must be rejected");
+  assert.match(out.body.error, /No such workspace/);
+
+  const db = dbOnDisk();
+  assert.equal(db.workspaces.some((w) => w.slug === ws.slug), false);
+  assert.equal(db.channels.some((c) => c.name === "ghost-channel"), false, "no orphan channel in memory or on disk");
+});
+
 test("the restore command never mistakes an unrelated workspace for a restore of the same slug", async () => {
   const { Store } = await import("../lib/store.js");
   const runRestore = (dataDir, args) => {
@@ -260,215 +337,29 @@ test("the restore command never mistakes an unrelated workspace for a restore of
   fs.rmSync(expFile, { force: true });
 });
 
-test("pages and static assets are served", async () => {
-  // A GET here can hit a keep-alive socket the server idled out (5 s) while
-  // the previous test's synchronous restore runs blocked this event loop;
-  // the connection then resets and undici reports "fetch failed". Browsers
-  // retry a reset idempotent GET the same way.
-  const get = async (p) => {
-    let err;
-    for (let i = 0; i < 3; i++) {
-      try {
-        return await fetch(`http://127.0.0.1:${port}${p}`);
-      } catch (e) {
-        err = e;
-      }
-    }
-    throw err;
-  };
-  const home = await get("/");
-  assert.match(await home.text(), /OpenSlack/);
-  assert.equal((await get("/app.js")).status, 200);
-  assert.equal((await get("/style.css")).status, 200);
-  const joinPage = await get("/join/abc123");
-  assert.match(await joinPage.text(), /Join a workspace/);
-  assert.equal((await get("/w/UPPER")).status, 404);
-  assert.equal((await call("POST", "/api/nope")).res.status, 404);
-});
-
-test("shutdown holds the data directory until in-flight requests finish", async () => {
-  // A server started exactly as the deployment does: under flock, holding the
-  // exclusive lock for its lifetime. SIGTERM must not hand the directory to a
-  // restore while a mutation request is still being received.
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-shutdown-"));
-  const port = 19000 + Math.floor(Math.random() * 500);
-  const lock = await import("../lib/lock.js");
-  const start = (p) => {
-    const cmd = lock.wrapper(dir, process.execPath, [path.join(ROOT_SERVER, "server.js")]);
-    return spawn(cmd.file, cmd.args, {
-      cwd: fs.mkdtempSync(path.join(os.tmpdir(), "openslack-shutdown-cwd-")),
-      env: { ...process.env, PORT: String(p), DATA_DIR: dir, NODE_ENV: "test" },
-      stdio: ["ignore", "pipe", "pipe"]
-    });
-  };
-  const child = start(port);
-  let childOut = "";
-  child.stdout.on("data", (d) => (childOut += d));
-  child.stderr.on("data", (d) => (childOut += d));
-  const exited = new Promise((resolve) => child.on("exit", (code) => resolve(code)));
-  try {
-    for (let i = 0; i < 100; i++) {
-      await new Promise((r) => setTimeout(r, 100));
-      try {
-        const res = await fetch(`http://127.0.0.1:${port}/healthz`);
-        if (res.ok) break;
-      } catch {}
-      if (i === 99) throw new Error(`child server did not start: ${childOut.slice(0, 300)}`);
-    }
-
-    const signup = await fetch(`http://127.0.0.1:${port}/api/signup`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ handle: "drainer", password: "longenough1" })
-    });
-    const cookie = (signup.headers.get("set-cookie") || "").split(";")[0];
-    const ws = await (
-      await fetch(`http://127.0.0.1:${port}/api/workspaces`, {
-        method: "POST",
-        headers: { "content-type": "application/json", cookie },
-        body: JSON.stringify({ name: "Drain" })
-      })
-    ).json();
-
-    // A mutation request whose body is only partly received: the server has
-    // the headers, the message is not yet written.
-    const body = JSON.stringify({ text: "posted during shutdown" });
-    const req = http.request({
-      host: "127.0.0.1",
-      port,
-      path: `/api/ws/${ws.slug}/channels/general/messages`,
-      method: "POST",
-      headers: { "content-type": "application/json", cookie, "content-length": String(body.length) }
-    });
-    req.write(body.slice(0, 5));
-    await new Promise((r) => setTimeout(r, 300)); // let the server take the request in
-
-    child.kill("SIGTERM"); // graceful shutdown: it must wait for this request
-    await new Promise((r) => setTimeout(r, 300));
-
-    // While the request is still open, the directory is still owned.
-    let refused = null;
-    try {
-      execFileSync(process.execPath, [path.join(ROOT_SERVER, "scripts", "restore.js"), path.join(os.tmpdir(), `no-such-export-${process.pid}.json`)], {
-        env: { ...process.env, DATA_DIR: dir },
-        encoding: "utf8",
-        timeout: 10000
-      });
-    } catch (err) {
-      refused = err;
-    }
-    assert.ok(refused, "restore must be refused while the server drains");
-    assert.match(String(refused.stderr), /owned by another live process/, String(refused.stderr).slice(0, 200));
-
-    // Finish the request: the server completes it, then exits, then the
-    // directory is free.
-    const res = await new Promise((resolve, reject) => {
-      req.on("response", resolve);
-      req.on("error", reject);
-      req.end(body.slice(5));
-    });
-    assert.equal(res.statusCode, 201, "the in-flight mutation completes during the drain");
-    res.resume();
-    assert.equal(await exited, 0, "the server exits once nothing can write");
-
-    // The directory is free again, and the message made it to disk.
-    const again = start(port + 1);
-    let restarted = false;
-    for (let i = 0; i < 100 && !restarted; i++) {
-      await new Promise((r) => setTimeout(r, 100));
-      try {
-        const res2 = await fetch(`http://127.0.0.1:${port + 1}/healthz`);
-        if (res2.ok) restarted = true;
-      } catch {}
-    }
-    assert.ok(restarted, "a new server acquires the freed directory");
-    const login = await fetch(`http://127.0.0.1:${port + 1}/api/login`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ handle: "drainer", password: "longenough1" })
-    });
-    const cookie2 = (login.headers.get("set-cookie") || "").split(";")[0];
-    const history = await (
-      await fetch(`http://127.0.0.1:${port + 1}/api/ws/${ws.slug}/channels/general/messages`, { headers: { cookie: cookie2 } })
-    ).json();
-    assert.ok((history.messages || []).some((m) => m.text === "posted during shutdown"), "the drained mutation persisted");
-    again.kill("SIGTERM");
-  } finally {
-    child.kill("SIGKILL");
-    await Promise.race([exited, new Promise((r) => setTimeout(r, 1000))]);
+// A stream is only as authenticated as the session that opened it.
+const until = async (fn, what, timeoutMs = 3000) => {
+  const start = Date.now();
+  for (;;) {
+    if (await fn()) return;
+    if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting: ${what}`);
+    await new Promise((r) => setTimeout(r, 25));
   }
-});
-
-// A mutation request whose JSON body is only partly delivered: the server has
-// taken the headers and is waiting for the rest, which lets the test change
-// the world (delete the workspace) before the body completes.
-function pendingBody(method, path, cookie, body) {
-  const req = http.request({
-    host: "127.0.0.1",
-    port,
-    path,
-    method,
-    headers: { "content-type": "application/json", cookie, "content-length": String(body.length) }
-  });
-  req.on("error", () => {}); // the outcome is asserted, not crashed on
-  req.write(body.slice(0, 2)); // just "{"
-  return () =>
-    new Promise((resolve, reject) => {
-      req.on("response", (res) => {
-        let data = "";
-        res.on("data", (c) => (data += c));
-        res.on("end", () => resolve({ status: res.statusCode, body: JSON.parse(data || "{}") }));
-      });
-      req.on("error", reject);
-      req.end(body.slice(2));
-    });
-}
-
-test("a workspace deleted while a channel-creation body is pending leaves no orphan channel", async () => {
-  const a = cookieOf((await call("POST", "/api/signup", { handle: "vanisher", password: "longenough1" })).res);
-  const ws = (await call("POST", "/api/workspaces", { name: "Vanish While Pending" }, a)).body;
-
-  const finish = pendingBody("POST", `/api/ws/${ws.slug}/channels`, a, JSON.stringify({ name: "doomed" }));
-  await new Promise((r) => setTimeout(r, 300)); // the server is now waiting for the body
-  assert.equal((await call("DELETE", `/api/ws/${ws.slug}`, null, a)).res.status, 200, "the owner deletes while the body is pending");
-
-  const res = await finish();
-  assert.equal(res.status, 404, "the mutation is refused against the deleted workspace");
-
-  // No orphan metadata anywhere: not in the live API, not on disk.
-  const me = await call("GET", "/api/me", null, a);
-  assert.ok(!me.body.workspaces.some((w) => w.slug === ws.slug));
-  const db = JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR, "db.json"), "utf8"));
-  assert.ok(!db.channels.some((c) => c.name === "doomed"), "no orphan channel record on disk");
-  assert.ok(!db.workspaces.some((w) => w.id === ws.id), "the workspace record is gone");
-  assert.ok(!db.members.some((x) => x.wsId === ws.id), "no membership rows left behind");
-});
-
-test("a workspace deleted while a message body is pending acknowledges nothing and stores nothing", async () => {
-  const a = cookieOf((await call("POST", "/api/signup", { handle: "vanisher2", password: "longenough1" })).res);
-  const ws = (await call("POST", "/api/workspaces", { name: "Vanish Mid Message" }, a)).body;
-  assert.equal((await call("POST", `/api/ws/${ws.slug}/channels/general/messages`, { text: "kept" }, a)).res.status, 201);
-
-  const text = "posted for a deleted workspace";
-  const finish = pendingBody("POST", `/api/ws/${ws.slug}/channels/general/messages`, a, JSON.stringify({ text }));
-  await new Promise((r) => setTimeout(r, 300));
-  assert.equal((await call("DELETE", `/api/ws/${ws.slug}`, null, a)).res.status, 200);
-
-  const res = await finish();
-  assert.equal(res.status, 404, "the message is not acknowledged for a deleted workspace");
-
-  // Nothing was written for it: not in the log on disk, not recoverable by a
-  // fresh store (the old bug acknowledged a message the next restart pruned).
-  const log = fs.readFileSync(path.join(process.env.DATA_DIR, "messages.jsonl"), "utf8");
-  assert.ok(!log.includes(text), "no message record in the log for the deleted workspace");
-  const { Store } = await import("../lib/store.js");
-  const store = new Store(process.env.DATA_DIR).init();
-  assert.ok(!store.messages.some((m) => m.text === text), "a fresh store recovers no such message");
-  assert.ok(!store.db.workspaces.some((w) => w.id === ws.id), "the workspace stays deleted");
-});
+};
 
 test("logging out ends a stream's live delivery; another session keeps receiving", async () => {
-  const make = async (handle) => cookieOf((await call("POST", "/api/signup", { handle, password: "longenough1" })).res);
+  // The signup must survive a stale pooled socket (the previous test's long
+  // execFileSync subprocesses idle out the keep-alive connections): one fresh
+  // connection is enough, like a real browser's silent retry.
+  const make = async (handle) => {
+    let r;
+    try {
+      r = await call("POST", "/api/signup", { handle, password: "longenough1" });
+    } catch {
+      r = await call("POST", "/api/signup", { handle, password: "longenough1" });
+    }
+    return cookieOf(r.res);
+  };
   const owner = await make("streamowner");
   const leaver = await make("streamleaver");
   const ws = (await call("POST", "/api/workspaces", { name: "Stream Auth" }, owner)).body;
@@ -576,6 +467,120 @@ test("an expired session's stream is terminated by broadcast and heartbeat, with
   api.endStreamsFor(t2);
   assert.equal(s2.res.ended, true, "logout terminates the stream");
   assert.ok(!api.streams.has(s2));
+});
+
+test("shutdown holds the data directory until in-flight requests finish", async () => {
+  // A server started exactly as the deployment does: under flock, holding the
+  // exclusive lock for its lifetime. SIGTERM must not hand the directory to a
+  // restore while a mutation request is still being received.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-shutdown-"));
+  const port = 19000 + Math.floor(Math.random() * 500);
+  const lock = await import("../lib/lock.js");
+  const start = (p) => {
+    const cmd = lock.wrapper(dir, process.execPath, [path.join(ROOT_SERVER, "server.js")]);
+    return spawn(cmd.file, cmd.args, {
+      cwd: fs.mkdtempSync(path.join(os.tmpdir(), "openslack-shutdown-cwd-")),
+      env: { ...process.env, PORT: String(p), DATA_DIR: dir, NODE_ENV: "test" },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+  };
+  const child = start(port);
+  let childOut = "";
+  child.stdout.on("data", (d) => (childOut += d));
+  child.stderr.on("data", (d) => (childOut += d));
+  const exited = new Promise((resolve) => child.on("exit", (code) => resolve(code)));
+  try {
+    for (let i = 0; i < 100; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/healthz`);
+        if (res.ok) break;
+      } catch {}
+      if (i === 99) throw new Error(`child server did not start: ${childOut.slice(0, 300)}`);
+    }
+
+    const signup = await fetch(`http://127.0.0.1:${port}/api/signup`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ handle: "drainer", password: "longenough1" })
+    });
+    const cookie = (signup.headers.get("set-cookie") || "").split(";")[0];
+    const ws = await (
+      await fetch(`http://127.0.0.1:${port}/api/workspaces`, {
+        method: "POST",
+        headers: { "content-type": "application/json", cookie },
+        body: JSON.stringify({ name: "Drain" })
+      })
+    ).json();
+
+    // A mutation request whose body is only partly received: the server has
+    // the headers, the message is not yet written.
+    const body = JSON.stringify({ text: "posted during shutdown" });
+    const req = http.request({
+      host: "127.0.0.1",
+      port,
+      path: `/api/ws/${ws.slug}/channels/general/messages`,
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, "content-length": String(body.length) }
+    });
+    req.write(body.slice(0, 5));
+    req.on("error", () => {}); // a destroyed socket is handled at the await below
+    await new Promise((r) => setTimeout(r, 300)); // let the server take the request in
+
+    child.kill("SIGTERM"); // graceful shutdown: it must wait for this request
+    await new Promise((r) => setTimeout(r, 300));
+
+    // While the request is still open, the directory is still owned.
+    let refused = null;
+    try {
+      execFileSync(process.execPath, [path.join(ROOT_SERVER, "scripts", "restore.js"), path.join(os.tmpdir(), `no-such-export-${process.pid}.json`)], {
+        env: { ...process.env, DATA_DIR: dir },
+        encoding: "utf8",
+        timeout: 10000
+      });
+    } catch (err) {
+      refused = err;
+    }
+    assert.ok(refused, "restore must be refused while the server drains");
+    assert.match(String(refused.stderr), /owned by another live process/, String(refused.stderr).slice(0, 200));
+
+    // Finish the request: the server completes it, then exits, then the
+    // directory is free.
+    const res = await new Promise((resolve, reject) => {
+      req.on("response", resolve);
+      req.on("error", reject);
+      req.end(body.slice(5));
+    });
+    assert.equal(res.statusCode, 201, "the in-flight mutation completes during the drain");
+    res.resume();
+    assert.equal(await exited, 0, "the server exits once nothing can write");
+
+    // The directory is free again, and the message made it to disk.
+    const again = start(port + 1);
+    let restarted = false;
+    for (let i = 0; i < 100 && !restarted; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      try {
+        const res2 = await fetch(`http://127.0.0.1:${port + 1}/healthz`);
+        if (res2.ok) restarted = true;
+      } catch {}
+    }
+    assert.ok(restarted, "a new server acquires the freed directory");
+    const login = await fetch(`http://127.0.0.1:${port + 1}/api/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ handle: "drainer", password: "longenough1" })
+    });
+    const cookie2 = (login.headers.get("set-cookie") || "").split(";")[0];
+    const history = await (
+      await fetch(`http://127.0.0.1:${port + 1}/api/ws/${ws.slug}/channels/general/messages`, { headers: { cookie: cookie2 } })
+    ).json();
+    assert.ok((history.messages || []).some((m) => m.text === "posted during shutdown"), "the drained mutation persisted");
+    again.kill("SIGTERM");
+  } finally {
+    child.kill("SIGKILL");
+    await Promise.race([exited, new Promise((r) => setTimeout(r, 1000))]);
+  }
 });
 
 test("server shuts down cleanly", async () => {

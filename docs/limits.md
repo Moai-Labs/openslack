@@ -18,12 +18,69 @@ direction requires. The product enforces these in code (`lib/limits.js`); tests 
 - Only the workspace owner can export or delete a workspace; any member can create
   channels and invite people while there is room.
 
+## Workspaces (paid tier — verified test payments only)
+
+- A workspace can be moved to the paid tier for **$12 per 30 days**, granting up to
+  **25 members** and history kept searchable for **365 days** (instead of the free
+  tier's 30 days).
+- **How a test payment is verified.** The owner opens a payment request in the
+  product, which shows exactly what to send: **$12 in test-USDC, plus the
+  request's own payment address** — exactly 12 test-USDC (12,000,000 raw
+  units, 6 decimals) of Circle's USDC contract
+  `0x036CbD53842c5426634e7929541eC2318f3dCF7e` on **Base Sepolia** (chain id
+  84532). Every request is bound to its **own non-reusable payment address**,
+  derived from the request's id alone (no key material is involved, so funds
+  sent there are by design unrecoverable — one more reason these transfers are
+  labelled tests worth nothing), so the transfer that satisfies one request can
+  never be claimed for any other request, at any time, in any state. The owner
+  sends that transfer from any wallet and pastes the transaction hash; the
+  server then verifies the receipt read-only through a public JSON-RPC node —
+  the chain id, the asset contract (its code is checked to exist on that
+  chain), the recipient, the exact amount, that the transaction settled
+  (receipt status success, transfer log present and not reorged away), and
+  that the transfer was mined in a block **strictly after the chain block the
+  node reported when the request was created** — a chain-derived creation
+  boundary, not a server-clock guess, so nobody's historical transfer can
+  confirm anything and no clock skew opens an allowance for old transfers. Only a
+  verified, settled transfer grants anything; an unmined, reverted, foreign or
+  too-old one leaves the workspace on the free tier with a clear error, and the
+  request stays open for a retry.
+- **These payments are labelled tests.** Every record is kind `test` and counts as
+  **zero revenue**: the tokens on the test chain have no value and no real money
+  moves. The tier line in the product always says "test payment".
+- **One transfer, one entitlement.** The verified transaction hash is recorded
+  in a consumed-transfer ledger that is kept apart from the per-workspace
+  payment records and survives workspace deletion (it names no person and no
+  workspace). A hash is refused if it ever funded a payment, in any workspace —
+  even if that workspace was deleted afterwards, and even if the chain later
+  presents the same transaction at a different block position. Deletion of a
+  confirmation that is still being verified grants nothing: the workspace,
+  owner and open request are re-checked immediately before anything is
+  committed, and the request is consumed and the transfer recorded as one
+  indivisible step, so two concurrent confirmations can never both win.
+- **Real payments stay blocked** until a supported checkout with verified settlement
+  exists. There is no way to pay real money in this version.
+- The entitlement is per workspace, starts when the transfer verifies, and
+  stacks: paying again while the tier is active extends it by 30 more days. When it
+  expires the workspace returns to the free tier limits on its own.
+- Exports do not carry the entitlement; a restored workspace starts on the free tier.
+- Deleting a workspace deletes its payment records with it.
+
+## Search
+
+- Every member can search their workspace's retained history from the product:
+  matches across **all channels**, newest first, each hit showing its channel,
+  with paging for older matches. Search covers everything retained for the
+  workspace (30 days free, 365 days paid), not just the newest page of a
+  channel, and never reaches outside the workspace.
+
 ## Messages and history
 
 - A message is at most **4,000 characters**.
 - Each user may post at most **30 messages per minute**.
-- History is retained **30 days** and at most the **most recent 10,000 messages** per
-  workspace, whichever binds first; older messages are pruned automatically.
+- History is retained **30 days** (free tier) or **365 days** (paid tier) and at most
+  the **most recent 10,000** (free) or **100,000** (paid) messages per workspace,
+  whichever binds first; older messages are pruned automatically.
 - Storage is capped at roughly **20 MB of message text per workspace**; when the cap is
   reached the oldest messages are dropped first.
 - Deleted messages cannot be recovered once pruned or once the workspace is deleted.
@@ -85,5 +142,5 @@ direction requires. The product enforces these in code (`lib/limits.js`); tests 
 
 ## What this version does not have
 
-Voice, file hosting, bots, token gates, message editing or read receipts. This list
-matches the adopted direction's deferrals.
+Real payments (test-USDC only, zero revenue), voice, file hosting, bots, token gates,
+message editing or read receipts. This list matches the adopted direction's deferrals.

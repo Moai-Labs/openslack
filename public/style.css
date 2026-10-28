@@ -113,6 +113,16 @@ form button, .side-actions button {
 .composer button { margin: 0; align-self: flex-end; }
 #msg-error { padding: 0 1.25rem 0.5rem; }
 
+.searchbar { display: flex; gap: 0.6rem; padding: 0.5rem 1.25rem; border-bottom: 1px solid #2a2e42; background: var(--panel); }
+.searchbar input { flex: 1; margin: 0; }
+.searchbar button { margin: 0; padding: 0.4rem 0.8rem; }
+#search-info { color: var(--muted); font-size: 0.8rem; flex: 1; align-self: center; }
+.load-more { display: block; margin: 0.5rem auto; padding: 0.4rem 1rem; }
+#pay-panel { margin-top: 0.5rem; padding: 0.6rem; border: 1px solid #3a2430; border-radius: 8px; }
+#pay-panel label { display: block; margin-bottom: 0.4rem; }
+#pay-panel input { width: 100%; margin: 0.25rem 0; }
+#pay-details { white-space: pre-wrap; }
+
 @media (max-width: 640px) {
   .chat { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
   .side { max-height: 40vh; }

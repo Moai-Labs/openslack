@@ -371,3 +371,43 @@ Docker CMD's non-blocking flock racing a replaced container (exit 160 leaves
 a machine that accepts connections and serves nothing) and the production
 storage refusal exiting before `listen` (same silent shape); both would show
 in container logs, which is what the tool request asks for.
+
+## Merge with main (2026-10-28, review round 4 session)
+
+Main moved far past the last merge point (it absorbed posts 17, 18, 49 and
+50: payments, search, paid tier, and its own reviewed recovery rewrite), so
+this session merged origin/main into post-16 and reconciled both lineages
+per file, keeping the superset of reviewed behaviour:
+
+- `server.js`, `lib/lock.js`, `Dockerfile`, `scripts/restore.js`: kept
+  post-16's versions — the fd-inherited flock wrapper, the observable
+  degraded start, the in-flight drain on shutdown, and the import/attach
+  separation with slug-collision refusal. Main's lock design (acquire()
+  taking the flock itself) and its older restore CLI are superseded here;
+  main's `lib/durable.js` and its test were removed in favour of
+  `lib/storage.js` (post-16's mountinfo-based verification).
+- `lib/api.js`: kept main's base (test-payment routes, search route,
+  tier info) and grafted post-16's round-4 SSE session binding back on:
+  each stream records its session token, `sessionLive()` re-authenticates
+  every delivery and heartbeat WITHOUT refreshing activity, logout ends the
+  session's streams, and expired/logged-out streams are terminated.
+- `lib/store.js`: kept main's base (payments, log rollback, fsync
+  hardening) and restored post-16's reviewed restore validations:
+  conflicting/many-to-one/missing-account attach mappings abort the restore
+  before anything is mutated, the restored workspace records `restoredFrom`
+  identity, a pending owner attached to an account that already joined is
+  promoted in both membership and ownerId, and `sessionLive()` supports the
+  SSE binding.
+- `public/app.js`: kept main's version. Its recovery is a stronger rewrite
+  of the same ideas post-16's round-3 fixes implemented: an ordered
+  `waiting` map renders only the contiguous next id, so a live event can
+  NEVER advance the cursor past unrecovered messages — the round-4 defect
+  (live events during initial history leaping the gap through `accept`) is
+  structurally impossible there. It also adds search UI, payment UI and
+  tier display.
+- Tests: kept main's suites as the base (they cover the deletion-race and
+  ordered-recovery classes) and added post-16's tests on top: the round-4
+  delayed-initial-history browser test (adapted to main's design), the SSE
+  logout/expiration stream tests, the shutdown in-flight drain test, the
+  restore slug-collision CLI test, and the store-level mapping-conflict,
+  restoredFrom and owner-promotion tests.

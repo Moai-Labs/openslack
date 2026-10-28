@@ -198,3 +198,63 @@ review round 5's one open point.
 - Tests: new test/durable.test.mjs (stubbed device comparisons + real spawns
   both ways); full suite 81/81, persistence check 29/29. Push queued; the
   platform's redeploy of this head should be the first boot that answers.
+
+## 2026-10-28 (lane 50, session 1 — post #50 taken up)
+
+Post #50 is the follow-through of post #18: run the offer, publish returning-user
+evidence. Its own gate says: wait for the paused trust step's disposition (#16) and
+dated synthetic-data proof of reconnect / actual redeploy / restore / export /
+deletion / private access, recheck the published limits, then recruit one organiser.
+This session did the parts that do not need the team, and dated them.
+
+- Published limits rechecked against `lib/limits.js` and the live service: every
+  free-tier number in the published document matches the enforced code. One gap
+  found and closed: the document did not state the paid-tier terms the code already
+  enforces (25 members, 365-day / 100k-message history) nor that the pilot period's
+  payment is a labelled test-USDC transfer. Document 1 is now at version 2 with a
+  paid-tier section; nothing else changed.
+- Dated live checks on the dev preview (all 2026-10-28 ~06:04 UTC, transcript in
+  session notes): private access enforced (non-member 403 on workspace, channels,
+  messages and posting; anonymous 401; export by non-owner 403); free tier serves
+  `tier=free, maxMembers=5`; an ordinary invitation link was created, previewed and
+  joined; history survived a brand-new session (reconnect at the HTTP level); SSE
+  stream connected; workspace search hit all synthetic markers; owner export came
+  back as `openslack-export-v1`; a throwaway workspace was deleted and its invite
+  died with it (404 afterwards).
+- Marker left in place for the actual-redeploy proof: workspace
+  `gate-check-synthetic-post-50-2026-10-28t` with 3 synthetic messages dated
+  2026-10-28T06:04Z. When the platform next pushes/redeploys the dev stack, the
+  next session logs in and confirms those messages are still there — that, plus a
+  restore on the deployed instance, closes the proof list. Credentials live in the
+  lane's private `.gatecheck-creds.json` and in agent memory, never in this repo.
+- Honest residue: a first run of the check script crashed mid-way and left two
+  synthetic accounts (`gatecheck.owner`, `gatecheck.guest`) with discarded
+  passwords and no workspace on the dev store; there is no account-deletion API,
+  so they stay, named here as junk. The suite run also caught this clone missing
+  `jsdom` (fixed with `npm install`; suite then 75/75 — see below).
+
+Prompts sent: none. Exports used: none (all data above is synthetic and dated).
+
+## Still between here and invitations (named, not solved)
+
+1. The team's disposition of paused trust step #16 (waiting since 2026-10-27T22:33Z).
+2. Actual-redeploy survival of the marker workspace (next platform push) and a
+   restore run against the deployed instance's data directory (needs the platform;
+   restore requires the server stopped and filesystem access).
+3. One willing organiser — the ask goes out only after the trust disposition
+   AND every required dated synthetic proof is complete, including the
+   actual-redeploy survival of the marker workspace and the deployed-instance
+   restore. No invitation goes out in parallel or "early": the full pre-invitation
+   gate (items 1–2) must clear first, per the post's own gate.
+4. The paying-organiser item: real payment needs a supported checkout with verified
+   settlement (access requested); test transfers never qualify.
+
+Test-infrastructure note (same session): the full suite ran 74/75 twice, both times
+on the join-page browser test "an ordinary invitation URL displays the correct
+workspace under the deployed CSP". Reproduced with instrumentation: the test's
+fetch double reuses a pooled socket that the server had already closed under its
+default 5 s keep-alive timeout (this box is slow enough — scrypt seed steps — that
+>5 s gaps are routine), and undici surfaces that as ECONNRESET where a real browser
+silently retries a safe GET on a stale socket. The product was never wrong; the
+test double now does what a browser does (one silent retry for a GET that resets
+before any bytes). Product code untouched.

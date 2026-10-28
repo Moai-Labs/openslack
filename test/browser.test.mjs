@@ -116,7 +116,20 @@ function browser(html, { url = `${base}/`, sid = null } = {}) {
     const target = p.startsWith("http") ? p : base + p;
     const headers = { ...(opts.headers || {}) };
     if (jar.size) headers.cookie = [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
-    const res = await fetch(target, { ...opts, headers, redirect: "manual" });
+    let res;
+    try {
+      res = await fetch(target, { ...opts, headers, redirect: "manual" });
+    } catch (err) {
+      // A real browser silently retries an idempotent request whose pooled
+      // socket the server closed before any bytes arrived (the default 5s
+      // keep-alive timeout bites whenever a slow step like scrypt leaves a
+      // longer gap); undici's raw fetch surfaces it as ECONNRESET instead.
+      // Retry once on a fresh connection, and only for a safe method —
+      // a POST that resets may already have run.
+      const safe = !opts.method || opts.method === "GET";
+      if (!(safe && err?.cause?.code === "ECONNRESET")) throw err;
+      res = await fetch(target, { ...opts, headers, redirect: "manual" });
+    }
     const set = res.headers.get("set-cookie");
     if (set) {
       const [pair, ...attrs] = set.split(";");

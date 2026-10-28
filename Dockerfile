@@ -15,5 +15,8 @@ EXPOSE 3000
 # refuses to start in production unless that path is a separate mount it can
 # write to, so an unmounted or unwritable volume fails the deploy loudly.
 RUN mkdir -p /data && chown node:node /data
+# lib/lock.js takes the data-directory lock with an OS flock via the
+# util-linux flock(1) utility; the base image does not ship it.
+RUN apk add --no-cache util-linux
 USER node
 CMD ["node", "server.js"]

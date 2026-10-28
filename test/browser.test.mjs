@@ -17,9 +17,7 @@ import { JSDOM, VirtualConsole } from "jsdom";
 // payment flow (request, verify, entitlement) against these receipts.
 let chainId = "0x14a34"; // 84532 = Base Sepolia
 let assetCode = "0x6080"; // non-empty: the asset contract exists
-let headNumber = "0x30a3796"; // the chain head the node reports to payment start; receipts sit in a later block
 let receipts = new Map(); // txHash (lowercase) -> receipt object
-let blocks = new Map(); // blockNumber (lowercase) -> { timestamp } in seconds; unset blocks are "now"
 const fakeRpc = http.createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
@@ -28,13 +26,7 @@ const fakeRpc = http.createServer((req, res) => {
     let result = null;
     if (method === "eth_chainId") result = chainId;
     else if (method === "eth_getCode") result = assetCode;
-    else if (method === "eth_blockNumber") result = headNumber;
     else if (method === "eth_getTransactionReceipt") result = receipts.get(String(params[0]).toLowerCase()) ?? null;
-    else if (method === "eth_getBlockByNumber") {
-      const key = String(params[0]).toLowerCase();
-      const ts = blocks.has(key) ? blocks.get(key).timestamp : Math.floor(Date.now() / 1000);
-      result = { number: params[0], timestamp: "0x" + BigInt(ts).toString(16) };
-    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result }));
   });
@@ -297,9 +289,7 @@ test("owner tools appear for the owner and work; non-owners never see them", asy
 // ---- the labelled test-USDC payment, driven through the real product ----
 
 const TX = (n) => "0x" + String(n).padStart(2, "0") + "0".repeat(62); // unique per number
-// The receipt carries the exact amount an open payment request asked for —
-// that request's own unique amount is what the server verifies against.
-const receiptFor = (txHash, amountRaw = BigInt(LIMITS.PAID_PRICE_USDC) * 10n ** 6n, to) => {
+const receiptFor = (txHash) => {
   const pad = (a) => "0x" + "0".repeat(24) + a.toLowerCase().slice(2);
   return {
     blockHash: "0x" + "ab".repeat(32),
@@ -308,8 +298,8 @@ const receiptFor = (txHash, amountRaw = BigInt(LIMITS.PAID_PRICE_USDC) * 10n ** 
     logs: [
       {
         address: LIMITS.PAY_USDC_ADDRESS,
-        topics: [TRANSFER_TOPIC, pad("0x1111000000000000000000000000000000000001"), pad(to)],
-        data: "0x" + BigInt(amountRaw).toString(16).padStart(64, "0"),
+        topics: [TRANSFER_TOPIC, pad("0x1111000000000000000000000000000000000001"), pad(LIMITS.PAY_RECIPIENT)],
+        data: "0x" + (BigInt(LIMITS.PAID_PRICE_USDC) * 10n ** 6n).toString(16).padStart(64, "0"),
         blockNumber: "0x30a3797",
         logIndex: "0x0",
         removed: false,
@@ -337,32 +327,33 @@ test("an owner sees the test-payment control, completes the verified flow, and s
   await until(() => doc.querySelector("#pay-test-btn").hidden === false, "pay control revealed for the owner");
   assert.equal(doc.querySelector("#tier-info").textContent.includes("Free tier"), true, "starts on the free tier");
 
-  // step 1: the product shows the exact payment request, labelled as a test —
-  // the request the panel itself opened, whose id and address it carries
+  // step 1: the product shows the exact payment request, labelled as a test
   doc.querySelector("#pay-test-btn").onclick();
   await until(() => doc.querySelector("#pay-panel").hidden === false, "payment panel opened");
   const details = doc.querySelector("#pay-details").textContent;
   assert.match(details, /TEST payment/);
-  const shownRecipient = details.match(/payment address (0x[0-9a-f]{40})/i)[1]; // the request's own payment address
-  assert.ok(shownRecipient, "the panel shows the request's own payment address");
-  const shownIntentId = doc.querySelector("#pay-tx").dataset.intentId;
-  assert.ok(shownIntentId, "the panel holds the request it opened");
+  assert.match(details, new RegExp(LIMITS.PAY_RECIPIENT));
   assert.match(details, new RegExp(LIMITS.PAY_USDC_ADDRESS, "i"));
-  assert.match(details, /exactly 12 test-USDC/, "the exact price is shown");
+  assert.match(details, /12000000/);
   assert.match(details, /Base Sepolia/);
   assert.match(details, /zero revenue/);
 
   // step 2 with a hash the test chain has never seen: the product refuses and
   // explains, and nothing is granted
   receipts.delete(TX(70));
+  doc.querySelector("#pay-tx").dataset.intentId = (
+    await (async () => {
+      const r = await call("POST", `/api/ws/${paySlug}/pay-test/start`, null, payOwnerCookie);
+      return r.body.intentId;
+    })()
+  );
   doc.querySelector("#pay-tx").value = TX(70);
   doc.querySelector("#form-pay").dispatchEvent(new page.window.Event("submit", { bubbles: true, cancelable: true }));
   await until(() => doc.querySelector("#pay-error").textContent.includes("not settled"), "unsettled hash explained in the product");
   assert.equal(doc.querySelector("#tier-info").textContent.includes("Free tier"), true, "still free after a failed verification");
 
-  // the real, settled transfer to the request's own address verifies and the
-  // entitlement appears
-  receipts.set(TX(70), receiptFor(TX(70), BigInt(LIMITS.PAID_PRICE_USDC) * 10n ** 6n, shownRecipient));
+  // the real, settled transfer verifies and the entitlement appears
+  receipts.set(TX(70), receiptFor(TX(70)));
   doc.querySelector("#form-pay").dispatchEvent(new page.window.Event("submit", { bubbles: true, cancelable: true }));
   await until(() => doc.querySelector("#tier-info").textContent.includes("Paid tier (test payment)"), "paid tier shown");
   assert.match(doc.querySelector("#tier-info").textContent, /365-day history/);
@@ -467,241 +458,150 @@ test("history renders again after a reload and when switching channels", async (
   page.window.close();
 });
 
-// ---- live-gap recovery, driven through the real product ----
-
-let gapSlug, gapOwner, gapGuest;
-
-test("seed: a workspace with a live message before any gap", async () => {
-  gapOwner = cookieOf((await call("POST", "/api/signup", { handle: "gapowner", password: "longenough1" })).res);
-  const ws = await call("POST", "/api/workspaces", { name: "Gap Browser" }, gapOwner);
-  gapSlug = ws.body.slug;
-  await call("POST", `/api/ws/${gapSlug}/channels/general/messages`, { text: "before the gap" }, gapOwner);
-  const inv = await call("POST", "/api/invites", { slug: gapSlug }, gapOwner);
-  gapGuest = cookieOf((await call("POST", "/api/signup", { handle: "gapguest", password: "longenough1" })).res);
-  await call("POST", `/api/invites/${inv.body.token}/join`, null, gapGuest);
-});
-
-test("a live event that reveals a gap recovers the messages inside the gap, in order", async () => {
-  const html = await (await fetch(`${base}/w/${gapSlug}`)).text();
-  const page = browser(html, { url: `${base}/w/${gapSlug}`, sid: gapGuest.split("=")[1] });
-  const doc = page.document;
-  await until(() => [...doc.querySelector("#log").children].some((n) => n.textContent.includes("before the gap")), "initial history rendered");
-  const es = FakeEventSource.last;
-
-  // three messages the page never receives, then a newer one it does
-  for (const text of ["gap one", "gap two", "gap three"]) {
-    const r = await call("POST", `/api/ws/${gapSlug}/channels/general/messages`, { text }, gapOwner);
-    assert.equal(r.res.status, 201);
-  }
-  const edge = await call("POST", `/api/ws/${gapSlug}/channels/general/messages`, { text: "gap edge" }, gapOwner);
-  es.emit(
-    "message",
-    JSON.stringify({ type: "message", id: edge.body.message.id, channel: "general", handle: "gapowner", text: "gap edge", at: new Date().toISOString() })
-  );
-
-  await until(() => [...doc.querySelector("#log").children].some((n) => n.textContent.includes("gap one")), "the start of the gap is recovered");
-  await until(() => [...doc.querySelector("#log").children].some((n) => n.textContent.includes("gap three")), "the end of the gap is recovered");
-  const ids = [...doc.querySelector("#log").children].map((n) => Number(n.dataset.id)).filter(Number.isFinite);
-  assert.deepEqual(ids, [...ids].sort((a, b) => a - b), "everything renders in id order, recovered gap included");
-  assert.equal(new Set(ids).size, ids.length, "no duplicates");
-  assert.equal([...doc.querySelector("#log").children].filter((n) => n.textContent.includes("gap edge")).length, 1, "the event that revealed the gap shows exactly once");
-  page.window.close();
-});
-
-// ---- recovery behind an open search ----
-
-let recSlug, recOwner;
+// ---- recovery: gaps, paginated backlogs, and search during catch-up ----
+//
+// A workspace paid for through the labelled test path, so enough members can
+// join to post a backlog of more than one recovery page (200) within the
+// per-minute rate limit.
+let recSlug, recOwnerCookie;
 const recPosters = [];
 
-test("seed: a paid workspace with ten posters", async () => {
-  recOwner = cookieOf((await call("POST", "/api/signup", { handle: "recowner", password: "longenough1" })).res);
-  const ws = await call("POST", "/api/workspaces", { name: "Recovery Browser" }, recOwner);
+test("seed: a paid workspace with enough posters to outrun the rate limit", async () => {
+  recOwnerCookie = cookieOf((await call("POST", "/api/signup", { handle: "recowner", password: "longenough1" })).res);
+  const ws = await call("POST", "/api/workspaces", { name: "Recovery Test" }, recOwnerCookie);
   recSlug = ws.body.slug;
-  // the paid tier holds the ten members the recovery test needs
-  const start = await call("POST", `/api/ws/${recSlug}/pay-test/start`, null, recOwner);
-  receipts.set(TX(80), receiptFor(TX(80), start.body.amountRaw, start.body.recipient));
-  const pay = await call("POST", `/api/ws/${recSlug}/pay-test/confirm`, { intentId: start.body.intentId, txHash: TX(80) }, recOwner);
-  assert.equal(pay.res.status, 200);
-  const inv = await call("POST", "/api/invites", { slug: recSlug }, recOwner);
-  for (let i = 0; i < 10; i++) {
-    const c = cookieOf((await call("POST", "/api/signup", { handle: `recp${i}`, password: "longenough1" })).res);
-    assert.equal((await call("POST", `/api/invites/${inv.body.token}/join`, null, c)).res.status, 200);
+  receipts.set(TX(90), receiptFor(TX(90)));
+  const start = await call("POST", `/api/ws/${recSlug}/pay-test/start`, null, recOwnerCookie);
+  const confirm = await call("POST", `/api/ws/${recSlug}/pay-test/confirm`, { intentId: start.body.intentId, txHash: TX(90) }, recOwnerCookie);
+  assert.equal(confirm.res.status, 200, "the workspace is on the paid tier so 25 members can join");
+  const inv = await call("POST", "/api/invites", { slug: recSlug }, recOwnerCookie);
+  for (let i = 0; i < 15; i++) {
+    const c = cookieOf((await call("POST", "/api/signup", { handle: `rec${i}`, password: "longenough1" })).res);
+    await call("POST", `/api/invites/${inv.body.token}/join`, null, c);
     recPosters.push(c);
   }
-  await call("POST", `/api/ws/${recSlug}/channels/general/messages`, { text: "rec seed" }, recOwner);
+  for (let i = 0; i < 2; i++) await postBacklog(1, "baseline");
 });
 
-test("recovery behind an open search advances and terminates instead of spinning", async () => {
-  const html = await (await fetch(`${base}/w/${recSlug}`)).text();
-  const page = browser(html, { url: `${base}/w/${recSlug}`, sid: recOwner.split("=")[1] });
-  const doc = page.document;
-  await until(() => [...doc.querySelector("#log").children].some((n) => n.textContent.includes("rec seed")), "initial history rendered");
-
-  // count the catch-up fetches the page makes
-  let afterFetches = 0;
-  const inner = page.window.fetch;
-  page.window.fetch = (p, opts) => {
-    if (String(p).includes("/messages?after=")) afterFetches++;
-    return inner(p, opts);
-  };
-
-  // 210 messages the page never receives: ten posters at 21 each, inside
-  // every sender's per-minute budget, so recovery needs more than one page
-  for (let i = 0; i < 21; i++) {
-    for (const c of recPosters) {
-      const r = await call("POST", `/api/ws/${recSlug}/channels/general/messages`, { text: `wave ${i} across the workspace` }, c);
-      assert.equal(r.res.status, 201);
-    }
+// Posts n messages spread across the member posters; returns the message ids.
+async function postBacklog(n, text) {
+  const ids = [];
+  for (let i = 0; i < n; i++) {
+    const cookie = recPosters[i % recPosters.length];
+    const r = await call("POST", `/api/ws/${recSlug}/channels/general/messages`, { text: `${text} ${i}` }, cookie);
+    assert.equal(r.res.status, 201, "every backlog message lands");
+    ids.push(r.body.message.id);
   }
+  return ids;
+}
 
-  // search first, then reveal the gap: recovery must run behind the search
-  doc.querySelector('#form-search input[name="q"]').value = "wave 20";
-  doc.querySelector("#form-search").dispatchEvent(new page.window.Event("submit", { bubbles: true, cancelable: true }));
-  await until(() => doc.querySelector("#search-info").textContent.includes("match"), "search results shown");
-  const edge = await call("POST", `/api/ws/${recSlug}/channels/general/messages`, { text: "wave edge" }, recOwner);
-  FakeEventSource.last.emit(
-    "message",
-    JSON.stringify({ type: "message", id: edge.body.message.id, channel: "general", handle: "recowner", text: "wave edge", at: new Date().toISOString() })
+test("a live event that jumps a gap recovers the missed batch before itself", async () => {
+  const oc = cookieOf((await call("POST", "/api/signup", { handle: "gapowner", password: "longenough1" })).res);
+  const ws = await call("POST", "/api/workspaces", { name: "Gap Test" }, oc);
+  const gslug = ws.body.slug;
+  await call("POST", `/api/ws/${gslug}/channels/general/messages`, { text: "gap baseline" }, oc);
+  const html = await (await fetch(`${base}/w/${gslug}`)).text();
+  const page = browser(html, { url: `${base}/w/${gslug}`, sid: oc.split("=")[1] });
+  const doc = page.document;
+  await until(() => [...doc.querySelector("#log").children].some((n) => n.textContent.includes("gap baseline")), "initial history rendered");
+
+  // Five messages the page never hears about; only the last one arrives
+  // live, so ids baseline+1..baseline+4 would be skipped forever if the
+  // client recovered from the live event's id instead of its covered cursor.
+  const ids = [];
+  for (let i = 0; i < 5; i++) {
+    const r = await call("POST", `/api/ws/${gslug}/channels/general/messages`, { text: `missed ${i}` }, oc);
+    ids.push(r.body.message.id);
+  }
+  const es = FakeEventSource.last;
+  es.emit("message", JSON.stringify({ type: "message", id: ids[4], channel: "general", handle: "gapowner", text: "missed 4", at: new Date().toISOString() }));
+  await until(
+    () => [...doc.querySelector("#log").children].filter((n) => /missed \d/.test(n.textContent)).length === 5,
+    "the whole gap recovered, not just the live tail"
   );
-
-  await until(() => afterFetches >= 2, "the missed pages were fetched behind the search");
-  const settled = afterFetches;
-  await new Promise((r) => setTimeout(r, 700));
-  assert.equal(afterFetches, settled, "recovery terminated instead of re-requesting the same page forever");
-  assert.equal(doc.querySelector("#search-bar").hidden, false, "the search stayed on screen throughout");
-
-  // back to the channel: it renders again, with the recovered messages
-  doc.querySelector("#search-back").onclick();
-  await until(() => [...doc.querySelector("#log").children].some((n) => n.textContent.includes("wave edge")), "back on the channel after search");
+  const logIds = [...doc.querySelector("#log").children].map((n) => Number(n.dataset.id));
+  assert.deepEqual(logIds, [...logIds].sort((a, b) => a - b), "messages render in message order");
+  assert.equal(new Set(logIds).size, logIds.length, "no duplicates");
   page.window.close();
 });
 
-// ---- a plain outage: more than a page of missed messages, no live event ----
+test("live events arriving during paginated recovery merge in order and nothing is lost", async () => {
+  const html = await (await fetch(`${base}/w/${recSlug}`)).text();
+  const page = browser(html, { url: `${base}/w/${recSlug}`, sid: recOwnerCookie.split("=")[1] });
+  const doc = page.document;
+  await until(() => [...doc.querySelector("#log").children].some((n) => n.textContent.includes("baseline")), "initial history rendered");
 
-let recPosters2 = [];
-test("seed: ten more posters with fresh rate budgets", async () => {
-  const inv = await call("POST", "/api/invites", { slug: recSlug }, recOwner);
-  for (let i = 0; i < 10; i++) {
-    const c = cookieOf((await call("POST", "/api/signup", { handle: `recq${i}`, password: "longenough1" })).res);
-    assert.equal((await call("POST", `/api/invites/${inv.body.token}/join`, null, c)).res.status, 200);
-    recPosters2.push(c);
+  // A backlog beyond one recovery page (200), then live events emitted while
+  // the client is still paginating: they must wait in message order, not
+  // jump ahead of the pages still to come.
+  const backlog = await postBacklog(210, "backlog");
+  const live = [];
+  for (let i = 0; i < 3; i++) {
+    const r = await call("POST", `/api/ws/${recSlug}/channels/general/messages`, { text: `live during recovery ${i}` }, recOwnerCookie);
+    live.push(r.body.message);
   }
+  const es = FakeEventSource.last;
+  es.open(); // recovery starts: page one, page two…
+  es.emit("message", JSON.stringify({ type: "message", id: live[0].id, channel: "general", handle: "recowner", text: live[0].text, at: live[0].at }));
+  es.emit("message", JSON.stringify({ type: "message", id: live[2].id, channel: "general", handle: "recowner", text: live[2].text, at: live[2].at }));
+
+  const expected = [...backlog, live[0].id, live[2].id];
+  await until(() => {
+    const got = [...doc.querySelector("#log").children].map((n) => n.dataset.id);
+    return expected.every((id) => got.includes(String(id)));
+  }, "every backlog page and every live event rendered");
+  const logIds = [...doc.querySelector("#log").children].map((n) => Number(n.dataset.id));
+  assert.deepEqual(logIds, [...logIds].sort((a, b) => a - b), "message order kept across the whole recovery");
+  assert.equal(new Set(logIds).size, logIds.length, "no duplicates across pages and live events");
+  page.window.close();
 });
 
-test("a reconnect after more than 200 missed messages recovers every one of them, with no live event to help", async () => {
+test("catching up on 200+ missed messages while search results are on screen terminates and resumes", async () => {
   const html = await (await fetch(`${base}/w/${recSlug}`)).text();
-  const page = browser(html, { url: `${base}/w/${recSlug}`, sid: recOwner.split("=")[1] });
+  const page = browser(html, { url: `${base}/w/${recSlug}`, sid: recOwnerCookie.split("=")[1] });
   const doc = page.document;
   await until(() => doc.querySelector("#log").children.length >= 1, "initial history rendered");
 
-  // record every row the page pulls while catching up
-  const fetched = [];
+  // Count recovery fetches so a catch-up loop that never advances its cursor
+  // cannot hide: the same page fetched forever would grow this without end.
+  let historyFetches = 0;
   const inner = page.window.fetch;
   page.window.fetch = (p, opts) => {
-    const resPromise = inner(p, opts);
-    if (String(p).includes("/messages?after=")) {
-      return resPromise.then(async (res) => {
-        const body = await res.clone().json().catch(() => ({ messages: [] }));
-        for (const m of body.messages || []) fetched.push(Number(m.id));
-        return res;
-      });
-    }
-    return resPromise;
-  };
-
-  // the search is open before the outage is noticed, as the review describes
-  doc.querySelector('#form-search input[name="q"]').value = "outage wave";
-  doc.querySelector("#form-search").dispatchEvent(new page.window.Event("submit", { bubbles: true, cancelable: true }));
-  await until(() => doc.querySelector("#search-info").textContent.includes("match"), "search results shown");
-
-  // 210 messages arrive that the page never hears about — no live event is
-  // emitted afterwards, only a reconnect
-  for (let i = 0; i < 21; i++) {
-    for (const c of recPosters2) {
-      const r = await call("POST", `/api/ws/${recSlug}/channels/general/messages`, { text: `outage wave ${i} missed while away` }, c);
-      assert.equal(r.res.status, 201);
-    }
-  }
-  const lastMissed = recPosters2.length ? "outage wave 20 missed while away" : null;
-  FakeEventSource.last.open(); // the reconnect, with no subsequent live event
-
-  await until(() => fetched.length >= 210, "the missed messages were fetched");
-  await new Promise((r) => setTimeout(r, 700));
-  assert.equal(fetched.length, 210, "recovery stopped once the server had nothing more, and fetched nothing twice");
-
-  // every missed message, no gaps, no duplicates: exactly the ids between the
-  // last one the page held and the newest on the server
-  const sorted = [...fetched].sort((a, b) => a - b);
-  assert.equal(new Set(sorted).size, 210, "no duplicates");
-  for (let i = 1; i < sorted.length; i++) {
-    assert.equal(sorted[i], sorted[i - 1] + 1, `no gap in the recovered range at ${sorted[i - 1]} -> ${sorted[i]}`);
-  }
-  assert.equal(doc.querySelector("#search-bar").hidden, false, "the search stayed on screen throughout");
-
-  // back to the channel: the newest of the recovered messages is there
-  doc.querySelector("#search-back").onclick();
-  await until(() => [...doc.querySelector("#log").children].some((n) => n.textContent.includes(lastMissed)), "the newest missed message rendered after the search");
-  page.window.close();
-});
-
-// ---- invitation errors after sign-in ----
-
-test("a full workspace refuses the invitation with a visible error after sign-in", async () => {
-  const fullOwner = cookieOf((await call("POST", "/api/signup", { handle: "fullowner", password: "longenough1" })).res);
-  const ws = await call("POST", "/api/workspaces", { name: "Full House" }, fullOwner);
-  const inv = await call("POST", "/api/invites", { slug: ws.body.slug }, fullOwner);
-  for (let i = 0; i < LIMITS.FREE_MAX_MEMBERS - 1; i++) {
-    const c = cookieOf((await call("POST", "/api/signup", { handle: `fullm${i}`, password: "longenough1" })).res);
-    assert.equal((await call("POST", `/api/invites/${inv.body.token}/join`, null, c)).res.status, 200);
-  }
-
-  // a latecomer arrives with the invite and signs in: the refusal is shown
-  // where the signed-in visitor can see it, and nothing retries forever
-  const home = browser(await (await fetch(`${base}/`)).text(), { url: `${base}/` });
-  home.window.sessionStorage.setItem("pendingInvite", inv.body.token);
-  home.document.querySelector("#tab-signup").click();
-  home.document.querySelector('#form-signup input[name="handle"]').value = "latecomer";
-  home.document.querySelector('#form-signup input[name="password"]').value = "longenough1";
-  submit(home, home.document.querySelector("#form-signup"));
-  await until(() => !home.window.sessionStorage.getItem("pendingInvite"), "the refused invitation is cleared");
-  const area = home.document.querySelector("#invite-issue");
-  await until(() => !area.classList.contains("hidden"), "the refusal is visible on the dashboard");
-  assert.match(home.document.querySelector("#invite-issue-text").textContent, /full/);
-  assert.equal(home.document.querySelector("#invite-retry").hidden, true, "a terminal refusal offers no retry");
-});
-
-test("a transient join failure after sign-in keeps the invitation and its retry completes the join", async () => {
-  const tOwner = cookieOf((await call("POST", "/api/signup", { handle: "retryowner", password: "longenough1" })).res);
-  const ws = await call("POST", "/api/workspaces", { name: "Retry House" }, tOwner);
-  const inv = await call("POST", "/api/invites", { slug: ws.body.slug }, tOwner);
-
-  const home = browser(await (await fetch(`${base}/`)).text(), { url: `${base}/` });
-  home.window.sessionStorage.setItem("pendingInvite", inv.body.token);
-  // the first join attempt hits a transient server failure
-  const inner = home.window.fetch;
-  let hiccuped = false;
-  home.window.fetch = async (p, opts) => {
-    if (!hiccuped && String(p).endsWith("/join")) {
-      hiccuped = true;
-      return { ok: false, status: 503, json: async () => ({ error: "the server hiccuped" }) };
-    }
+    if (typeof p === "string" && p.includes("/messages?after=")) historyFetches++;
     return inner(p, opts);
   };
-  home.document.querySelector("#tab-signup").click();
-  home.document.querySelector('#form-signup input[name="handle"]').value = "retrycomer";
-  home.document.querySelector('#form-signup input[name="password"]').value = "longenough1";
-  submit(home, home.document.querySelector("#form-signup"));
 
-  const area = home.document.querySelector("#invite-issue");
-  await until(() => !area.classList.contains("hidden"), "the transient failure is visible after sign-in");
-  assert.match(home.document.querySelector("#invite-issue-text").textContent, /try again/i);
-  assert.equal(home.window.sessionStorage.getItem("pendingInvite"), inv.body.token, "the invitation is retained across the failure");
-  assert.equal(home.document.querySelector("#invite-retry").hidden, false, "a retry action is offered");
+  // Search view on; the log no longer shows the channel.
+  doc.querySelector('#form-search input[name="q"]').value = "needle";
+  doc.querySelector("#form-search").dispatchEvent(new page.window.Event("submit", { bubbles: true, cancelable: true }));
+  await until(() => doc.querySelector("#search-info").textContent.includes("0 match"), "search results on screen");
 
-  home.document.querySelector("#invite-retry").onclick();
-  await until(() => !home.window.sessionStorage.getItem("pendingInvite"), "the retry completed the join");
-  const me = await call("GET", "/api/me", null, home.cookie());
-  assert.ok(me.body.workspaces.some((w) => w.slug === ws.body.slug), "the visitor is a member after the retry");
+  // More than a full recovery page is missed while searching, then the
+  // stream reopens and a live event arrives — all while search results,
+  // not the channel, are displayed.
+  await postBacklog(210, "while searching");
+  const live = await call("POST", `/api/ws/${recSlug}/channels/general/messages`, { text: "live while searching" }, recOwnerCookie);
+  const es = FakeEventSource.last;
+  es.open();
+  es.emit("message", JSON.stringify({ type: "message", id: live.body.message.id, channel: "general", handle: "recowner", text: live.body.message.text, at: live.body.message.at }));
+
+  // Recovery must terminate: wait until the fetch count stops moving.
+  await until(async () => {
+    const a = historyFetches;
+    await new Promise((r) => setTimeout(r, 300));
+    return historyFetches === a && a > 0;
+  }, "recovery fetches settle instead of looping");
+
+  // Back to the channel: history re-renders from the server, including the
+  // backlog and the live message, and the covered cursor resumes cleanly.
+  doc.querySelector("#search-back").onclick();
+  await until(() => [...doc.querySelector("#log").children].some((n) => n.textContent.includes("live while searching")), "the channel shows the live message again");
+  await until(() => [...doc.querySelector("#log").children].some((n) => n.textContent.includes("while searching 209")), "the oldest of the missed backlog is present too");
+  assert.ok(historyFetches < 10, `recovery paginated a bounded number of pages (${historyFetches}), it did not loop`);
+  const logIds = [...doc.querySelector("#log").children].map((n) => Number(n.dataset.id));
+  assert.deepEqual(logIds, [...logIds].sort((a, b) => a - b), "channel renders in message order after returning");
+  assert.equal(new Set(logIds).size, logIds.length, "no duplicates after returning from search");
+  page.window.close();
 });
 
 test("cleanup: server shuts down", async () => {

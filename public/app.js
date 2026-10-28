@@ -177,11 +177,15 @@ function initJoin() {
 function initChat() {
   const slug = document.querySelector("#chat").dataset.slug;
   let current = "general";
-  let lastId = 0; // last message id shown for the current channel
-  let recoverFrom = 0; // everything after this id still has to be fetched and merged
-  let recoverRun = 0; // which recovery loop owns the cursor; a new one supersedes it
-  let historyGen = 0; // bumped on every switch; stale history responses are dropped
+  // The coverage cursor: every message with an id <= lastId has been rendered
+  // or is otherwise accounted for. It is separate from any single live event —
+  // a live event that jumps a gap must never drag the cursor past the missed
+  // messages, or recovery would start beyond them and lose them for good.
+  let lastId = 0;
+  let historyGen = 0; // bumped on every switch; stale history and recovery responses are dropped
   let channelReady = false; // the current channel's initial history has rendered
+  let filling = false; // a recovery fetch loop is running
+  const waiting = new Map(); // id -> message: arrived ahead of the coverage cursor
   let role = "member";
   let tier = "free";
   let maxMembers = 0;
@@ -203,12 +207,14 @@ function initChat() {
 
   const log = $("#log");
   // While a workspace search is on screen the log holds search results, not
-  // the channel, so live messages must not land in it. Recovery that runs
-  // during a search still advances its cursors — only the rendering waits.
+  // the channel, so live messages must not land in it. Coverage still
+  // advances while searching (see deliver), and going back to the channel
+  // re-renders its history from the server, so nothing shown there is lost.
   let searchView = false;
-  const append = (m, channel) => {
+
+  // Rendering only: never moves the coverage cursor.
+  const render = (m, channel) => {
     if (searchView || channel !== current) return;
-    lastId = Math.max(lastId, Number(m.id)); // even for duplicates: the id is now covered
     if (log.querySelector(`[data-id="${m.id}"]`)) return;
     // Insert in id order: a recovered gap must slot in before newer messages
     // that were already rendered, never after them.
@@ -224,6 +230,29 @@ function initChat() {
     }
     log.append(node);
     log.scrollTop = log.scrollHeight;
+  };
+
+  // Account for one message, live or recovered. Anything ahead of the cursor
+  // waits until everything before it is covered, so events merge into message
+  // order no matter when they arrived. Returns true when messages are still
+  // waiting past a hole in the covered range — the server must be asked for it.
+  const deliver = (m, channel) => {
+    if (channel !== current) return false;
+    const id = Number(m.id);
+    if (!Number.isFinite(id) || id <= lastId) return waiting.size > 0; // already covered
+    waiting.set(id, m);
+    return flushWaiting(channel);
+  };
+
+  const flushWaiting = (channel) => {
+    for (;;) {
+      const next = waiting.get(lastId + 1);
+      if (!next) break;
+      waiting.delete(lastId + 1);
+      render(next, channel);
+      lastId = lastId + 1;
+    }
+    return waiting.size > 0;
   };
 
   // Search results read with their channel: a hit from another channel means
@@ -309,53 +338,59 @@ function initChat() {
     channelReady = false;
     const data = await fetchHistory(channel, null, 100);
     if (gen !== historyGen) return; // the user switched channels meanwhile
-    for (const m of data.messages) append(m, channel);
+    let top = 0;
+    for (const m of data.messages) {
+      render(m, channel);
+      const n = Number(m.id);
+      if (Number.isFinite(n) && n > top) top = n;
+    }
+    // Events that queued while the initial page was in flight are covered by
+    // it up to its newest id; anything beyond that waits for recovery.
+    for (const id of waiting.keys()) if (id <= top) waiting.delete(id);
+    lastId = top;
     channelReady = true;
-    recoverFrom = lastId; // everything up to the newest rendered id is held
     log.scrollTop = log.scrollHeight;
+    if (waiting.size) fill(channel).catch(() => {});
   }
 
-  // Recover everything missed while the stream was down — a live gap or a full
-  // outage — oldest first, paginating until the server has nothing left.
-  //
-  // The cursor is the recovery's own, not the render's: appending a live event
-  // that revealed a gap must not move the cursor past the messages inside it,
-  // and a search on screen (which defers rendering) must not stall it either.
-  // Whether to keep going is decided by the page that just came back, never by
-  // the newest locally known id: a full page means more may exist on the
-  // server even when nothing newer has been seen locally, so a full page is
-  // always followed up, and a short or empty page ends the run. The cursor
-  // strictly advances on every non-empty page, so the loop always moves
-  // forward and always terminates. A newer recovery supersedes a running one
-  // at the next page boundary; the cursor carries over, so no range is skipped.
-  function startRecovery(channel, fromId) {
-    if (!channelReady) return; // the initial load has not set the cursors yet
-    if (fromId != null) recoverFrom = Math.min(recoverFrom, Number(fromId)); // recover from before the gap
-    const run = ++recoverRun;
-    (async () => {
+  // Recover everything the covered cursor has not seen: on (re)connect for
+  // whatever the stream missed while it was down, or on demand when a live
+  // event jumped a gap. Oldest first, paginating until the server has nothing
+  // more and nothing is waiting out of order. The cursor only ever moves
+  // through flushWaiting — a fetched page can never be marked covered without
+  // its predecessors being accounted for too.
+  async function fill(channel) {
+    if (filling || !channelReady) return;
+    filling = true;
+    try {
+      const gen = historyGen;
       for (;;) {
-        if (run !== recoverRun || channel !== current) return;
-        const data = await fetchHistory(channel, recoverFrom, 200);
-        if (run !== recoverRun || channel !== current) return;
-        const missed = data.messages || [];
-        for (const m of missed) append(m, channel); // rendering defers during a search; the cursor does not
-        if (missed.length) {
-          recoverFrom = Math.max(recoverFrom, Number(missed[missed.length - 1].id));
-          lastId = Math.max(lastId, recoverFrom);
-        } else {
-          recoverFrom = lastId; // nothing between the cursor and the newest held id
+        if (gen !== historyGen || channel !== current) return;
+        const data = await fetchHistory(channel, lastId, 200);
+        if (gen !== historyGen || channel !== current) return;
+        const rows = data.messages || [];
+        const before = lastId;
+        for (const m of rows) deliver(m, channel);
+        if (rows.length < 200 && !waiting.size) return; // fully caught up
+        if (lastId === before && waiting.size) {
+          // No progress while the server holds nothing between the cursor and
+          // the waiting ids: that stretch no longer exists (pruned history).
+          // Re-anchor past the unfillable hole rather than stall forever.
+          lastId = Math.min(...waiting.keys()) - 1;
+          flushWaiting(channel);
         }
-        if (missed.length < 200) return;
       }
-    })().catch(() => {}); // a failed page leaves the cursor behind; the next live event or reconnect retries
+    } finally {
+      filling = false;
+    }
   }
 
   async function switchChannel(name) {
     historyGen++; // anything in flight for the old channel is now stale
-    recoverRun++; // an old recovery loop stops at its next page boundary
     current = name;
     lastId = 0;
-    recoverFrom = 0;
+    waiting.clear();
+    channelReady = false;
     log.textContent = "";
     exitSearch();
     $("#ch-name").textContent = "#" + name;
@@ -367,17 +402,15 @@ function initChat() {
     conn.textContent = "connecting…"; conn.classList.remove("live");
     const es = new EventSource(`/api/ws/${slug}/stream`);
     es.addEventListener("message", (e) => {
-      const m = JSON.parse(e.data);
-      if (m.type !== "message" || m.channel !== current) return;
-      const id = Number(m.id);
-      const from = lastId; // recovery must start before any gap this event reveals
-      lastId = Math.max(lastId, id); // the id is held now, rendered or not — a search on screen defers rendering, not recovery
-      if (id > from + 1) startRecovery(current, from); // fetch everything that was missed in between
-      append(m, m.channel);
+      let m;
+      try { m = JSON.parse(e.data); } catch { return; } // a malformed frame is dropped, not fatal
+      if (m.type !== "message") return;
+      deliver(m, m.channel);
+      if (waiting.size) fill(current).catch(() => {}); // a gap opened: ask the server to fill it
     });
     es.onopen = () => {
       conn.textContent = "live"; conn.classList.add("live");
-      startRecovery(current); // recover anything missed while away
+      fill(current).catch(() => {}); // recover anything missed while the stream was down
     };
     es.onerror = () => {
       conn.textContent = "reconnecting…"; conn.classList.remove("live");

@@ -194,6 +194,80 @@ test("pages and static assets are served", async () => {
   assert.equal((await call("POST", "/api/nope")).res.status, 404);
 });
 
+// Opens a request whose body is deliberately held back: the server has
+// already resolved the workspace and channel and is parked awaiting the
+// body, which is exactly the window in which another request can delete the
+// workspace. The returned finish() completes the body.
+function pendingRequest(method, p, cookie, body) {
+  let finishBody;
+  const response = new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: "127.0.0.1", port, method, path: p, headers: { cookie, "content-type": "application/json" } },
+      (r) => {
+        let data = "";
+        r.on("data", (c) => (data += c));
+        r.on("end", () => {
+          try {
+            resolve({ status: r.statusCode, body: JSON.parse(data || "{}") });
+          } catch (err) {
+            reject(err);
+          }
+        });
+      }
+    );
+    req.on("error", reject);
+    req.flushHeaders(); // headers only: the server is now waiting in readJson()
+    finishBody = () => req.end(JSON.stringify(body));
+  });
+  return { finish: finishBody, response };
+}
+
+const dbOnDisk = () => JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR, "db.json"), "utf8"));
+const logOnDisk = () => fs.readFileSync(path.join(process.env.DATA_DIR, "messages.jsonl"), "utf8");
+
+test("a message finished after its workspace was deleted is rejected, with no orphan on disk", async () => {
+  const a = cookieOf((await call("POST", "/api/signup", { handle: "stale-owner", password: "longenough1" })).res);
+  const b = cookieOf((await call("POST", "/api/signup", { handle: "stale-member", password: "longenough1" })).res);
+  const ws = (await call("POST", "/api/workspaces", { name: "Stale Body" }, a)).body;
+  const inv = (await call("POST", "/api/invites", { slug: ws.slug }, a)).body;
+  await call("POST", `/api/invites/${inv.token}/join`, null, b);
+
+  // The member opens a message post whose body never arrives; the server
+  // resolves the workspace, checks membership and parks in readJson().
+  const pending = pendingRequest("POST", `/api/ws/${ws.slug}/channels/general/messages`, b, { text: "orphan message" });
+  await new Promise((r) => setTimeout(r, 100));
+  // The owner deletes the workspace while that body is still pending.
+  assert.equal((await call("DELETE", `/api/ws/${ws.slug}`, null, a)).res.status, 200);
+  pending.finish();
+  const out = await pending.response;
+  assert.equal(out.status, 404, "the stale continuation must be rejected");
+  assert.match(out.body.error, /No such workspace/);
+
+  // Nothing was written for the deleted workspace: not on disk, not in a
+  // later viewer's history, and no broadcast could have reached a stream
+  // because the mutation never ran.
+  const db = dbOnDisk();
+  assert.equal(db.workspaces.some((w) => w.slug === ws.slug), false);
+  assert.equal(logOnDisk().includes("orphan message"), false, "no orphan message appended to the log");
+});
+
+test("a channel created after its workspace was deleted is rejected, with no orphan on disk", async () => {
+  const a = cookieOf((await call("POST", "/api/signup", { handle: "stale-owner-2", password: "longenough1" })).res);
+  const ws = (await call("POST", "/api/workspaces", { name: "Stale Channel" }, a)).body;
+
+  const pending = pendingRequest("POST", `/api/ws/${ws.slug}/channels`, a, { name: "ghost-channel" });
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal((await call("DELETE", `/api/ws/${ws.slug}`, null, a)).res.status, 200);
+  pending.finish();
+  const out = await pending.response;
+  assert.equal(out.status, 404, "the stale continuation must be rejected");
+  assert.match(out.body.error, /No such workspace/);
+
+  const db = dbOnDisk();
+  assert.equal(db.workspaces.some((w) => w.slug === ws.slug), false);
+  assert.equal(db.channels.some((c) => c.name === "ghost-channel"), false, "no orphan channel in memory or on disk");
+});
+
 test("server shuts down cleanly", async () => {
   server.closeAllConnections();
   await new Promise((resolve) => server.close(resolve));

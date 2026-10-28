@@ -22,14 +22,16 @@ let rpcDelayMs = 0; // holds every verification call in flight, for concurrency 
 const fakeRpc = http.createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
-  req.on("end", () => {
+  req.on("end", async () => {
     const { method, params } = JSON.parse(body);
     let result = null;
     if (method === "eth_chainId") result = chainId;
     else if (method === "eth_getCode") result = assetCode;
     else if (method === "eth_blockNumber") result = headNumber;
-    else if (method === "eth_getTransactionReceipt") result = receipts.get(String(params[0]).toLowerCase()) ?? null;
-    else if (method === "eth_getBlockByNumber") {
+    else if (method === "eth_getTransactionReceipt") {
+      result = receipts.get(String(params[0]).toLowerCase()) ?? null;
+      if (holdReceipt) await holdReceipt; // a test holds verification mid-flight to race the store
+    } else if (method === "eth_getBlockByNumber") {
       const key = String(params[0]).toLowerCase();
       const ts = blocks.has(key) ? blocks.get(key).timestamp : Math.floor(Date.now() / 1000);
       result = { number: params[0], timestamp: "0x" + BigInt(ts).toString(16) };
@@ -42,6 +44,9 @@ const fakeRpc = http.createServer((req, res) => {
     else respond();
   });
 });
+// When set to a promise, every receipt response waits on it — a test deletes a
+// workspace or confirms again while verification is still awaiting the node.
+let holdReceipt = null;
 await new Promise((resolve) => fakeRpc.listen(0, "127.0.0.1", resolve));
 process.env.PAY_RPC_URL = `http://127.0.0.1:${fakeRpc.address().port}`;
 
@@ -283,6 +288,60 @@ test("only the workspace owner can confirm, and only against a live request", as
   const stale = await s.startTestPayment(ws, a);
   stale.expiresAt = new Date(Date.now() - 1000).toISOString();
   await assert.rejects(() => s.completeTestPayment(ws, a, stale.id, TX(30)), (e) => e.status === 404);
+});
+
+test("a workspace deleted while verification is in flight grants nothing and leaves nothing behind", async () => {
+  const s = freshStore();
+  const a = s.createUser("vanisher", "longenough1");
+  const ws = s.createWorkspace(a, "Vanishing");
+  receipts.set(TX(80), transferReceipt({ txHash: TX(80), to: RECIPIENT }));
+  const intent = s.startTestPayment(ws, a);
+
+  let release;
+  holdReceipt = new Promise((r) => (release = r));
+  const settling = s.completeTestPayment(ws, a, intent.id, TX(80));
+  await new Promise((r) => setTimeout(r, 50)); // verification is now awaiting the receipt
+  s.deleteWorkspace(ws); // the world moves on while the node is asked
+  release();
+  holdReceipt = null;
+  await assert.rejects(settling, (e) => e.status === 404 && /no longer exists/.test(e.message));
+
+  assert.equal(s.workspaceBySlug(ws.slug), null, "the workspace was not resurrected");
+  assert.equal((s.db.payments || []).length, 0, "no payment record for a deleted workspace");
+  assert.equal((s.db.paymentIntents || []).length, 0, "no intent record for a deleted workspace");
+  assert.equal(s.messages.some((m) => m.handle === "vanisher"), false, "no records carry the deleted payer's handle");
+});
+
+test("confirmations racing on one intent settle it exactly once", async () => {
+  const s = freshStore();
+  const a = s.createUser("racer", "longenough1");
+  const ws = s.createWorkspace(a, "Once Only");
+  receipts.set(TX(81), transferReceipt({ txHash: TX(81), to: RECIPIENT }));
+  receipts.set(TX(82), transferReceipt({ txHash: TX(82), to: RECIPIENT }));
+  const intent = s.startTestPayment(ws, a);
+
+  let release;
+  holdReceipt = new Promise((r) => (release = r));
+  const outcomes = [
+    s.completeTestPayment(ws, a, intent.id, TX(81)).then(() => "settled", (e) => e),
+    s.completeTestPayment(ws, a, intent.id, TX(82)).then(() => "settled", (e) => e)
+  ];
+  await new Promise((r) => setTimeout(r, 50)); // both confirmations await the same node
+  release();
+  holdReceipt = null;
+  const [one, two] = await Promise.all(outcomes);
+
+  const granted = [one, two].filter((r) => r === "settled");
+  const refused = [one, two].filter((r) => r !== "settled");
+  assert.equal(granted.length, 1, "exactly one confirmation settled");
+  assert.equal(refused.length, 1, "the other was refused");
+  assert.equal(refused[0].status, 409, "the refusal is a conflict, not a crash");
+  assert.equal((s.db.payments || []).filter((p) => p.wsId === ws.id).length, 1, "one payment record");
+  const settledIntent = s.db.paymentIntents.find((i) => i.id === intent.id);
+  assert.equal(settledIntent.status, "settled");
+  // exactly one 30-day extension: paidUntil sits one PAID_DAYS from now, not two
+  const days = (Date.parse(ws.paidUntil) - Date.now()) / 86400000;
+  assert.ok(days > LIMITS.PAID_DAYS - 0.01 && days <= LIMITS.PAID_DAYS, "the entitlement was extended once, not twice");
 });
 
 test("a workspace cannot drown in open payment requests", async () => {

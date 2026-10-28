@@ -53,6 +53,10 @@ for (let i = 0; i < argv.length; i++) {
 
 let dirLock;
 try {
+  // This script holds the OS flock itself for its whole run, so no other
+  // writer can acquire the directory while the rewrite below is in progress;
+  // killing this script frees the lock only by ending the script. release()
+  // in the finally block is the intentional release.
   dirLock = acquire(resolveDataDir(), "restore");
 } catch (err) {
   console.error(err instanceof LockError ? err.message : err);
@@ -62,6 +66,8 @@ try {
 }
 
 try {
+  // The rewrite below is one synchronous block, and this process owns the
+  // directory for as long as it runs: nothing can interleave with it.
   const store = new Store(resolveDataDir()).init();
   const exported = JSON.parse(fs.readFileSync(file, "utf8"));
 

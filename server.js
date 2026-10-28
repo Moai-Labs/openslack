@@ -70,6 +70,12 @@ const { dir: dataDir, durable } = resolveDataDir();
 
 // One owner per data directory: a restore run against a live server would be
 // overwritten by the server's stale in-memory state on its next save.
+//
+// This process holds the OS flock itself, for its entire life, so there is no
+// loss to watch for while we run: the kernel frees the directory only when we
+// die or release() it, and killing any other process cannot free it. A
+// restart takes the lock again before serving anything. release() during our
+// own SIGTERM shutdown is an intentional release.
 let dirLock;
 try {
   dirLock = acquire(dataDir, "server");
@@ -91,6 +97,12 @@ const staticFiles = new Map(
 );
 
 const server = http.createServer(async (req, res) => {
+  // After release() — our own SIGTERM teardown — refuse everything rather
+  // than serve (and write) while the directory is up for grabs. While the
+  // process lives and has not released, it owns the directory outright.
+  if (!dirLock.alive()) {
+    return sendJson(res, 503, { error: "The server has lost exclusive ownership of its data directory and is shutting down." });
+  }
   res.setHeader("x-content-type-options", "nosniff");
   res.setHeader("referrer-policy", "no-referrer");
   res.setHeader("content-security-policy", "default-src 'self'; frame-ancestors 'none'");

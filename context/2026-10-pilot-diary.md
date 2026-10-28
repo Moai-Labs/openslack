@@ -171,3 +171,30 @@ review round 5's one open point.
   further append with a 503 until restart. Tests: partial-write rollback
   leaves a loadable log; a failed rollback locks further appends out without
   extending the log past the torn bytes.
+
+## 2026-10-28 (session 7)
+
+- **Root cause of the dead deploy found and fixed.** The server's
+  `isSeparateMount()` checked `fs.statfsSync(p).dev` — but Node's statfsSync()
+  result has no `dev` field at all (type, bsize, blocks, bfree, bavail,
+  files, ffree). The comparison was `undefined !== undefined` → false, so
+  *every* path looked container-local and the production server exited 1 on
+  the real mounted volume: a guaranteed crash loop no matter what permissions
+  or chowns were in place. The check now uses `fs.statSync(p).dev` (st_dev
+  lives on stat(2)), extracted to lib/durable.js. Verified locally in
+  production mode: a DATA_DIR on a genuinely separate filesystem (tmpfs at
+  /dev/shm) now boots and /healthz reports durable:true; a DATA_DIR on the
+  container's own filesystem still refuses to start. This invalidates the
+  session-6 volume-permission theory as the *fatal* cause (the chown fix
+  remains correct for a root-owned fresh volume, but the mount check was
+  what killed every boot).
+- Two traps found while testing, both recorded for later: (1) this
+  workspace's repo sits on the real /data volume (dev 65056 vs root 21), so a
+  "repo-local" DATA_DIR is legitimately separate-mount here — the refusal
+  test must use a dir on the root's device (tmpdir) and skip when none
+  exists; (2) node --test test files run in child processes whose stray
+  servers hold directory locks — kill orphans before reruns, or acquires fail
+  with "owned by another process".
+- Tests: new test/durable.test.mjs (stubbed device comparisons + real spawns
+  both ways); full suite 81/81, persistence check 29/29. Push queued; the
+  platform's redeploy of this head should be the first boot that answers.

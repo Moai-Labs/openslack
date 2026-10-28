@@ -7,14 +7,14 @@ Gate review **November 3**; outcome target **November 10**. Today is 2026-10-27.
 
 ## Status and dependencies (honest)
 
-- Updated 2026-10-28 (session 6): the round-5 merge (53a6a52) was deployed to
-  the fly dev app but the machine never answered. Reproduced the likely cause
-  locally — a root-owned fresh volume defeats the image's `USER node` write
-  probe, so the server exits 1 in a crash loop — and the image now chowns the
-  volume mount at entrypoint before dropping to node. The round-5 open point
-  (a torn append can poison the message log) is also fixed with rollback +
-  fail-closed refusal. Still **not deployed**: the fixes wait on the next
-  push; no invitation can be sent until a deploy actually answers.
+- Updated 2026-10-28 (session 7): **root cause of the dead deploy found.**
+  The production durability check compared `fs.statfsSync(p).dev` — Node's
+  statfsSync() result has no `dev` field, so every path looked
+  container-local and the server exited 1 on the real mounted volume. Fixed
+  via `fs.statSync(p).dev` (lib/durable.js), verified both ways in
+  production mode locally. Suite 81/81, persistence 29/29. The redeploy of
+  this head is the first boot that should actually answer; recruitment
+  starts the day a deploy answers.
 - Updated 2026-10-27 (session 4): review round 2 asked for two changes; both
   are made on `post-18` — the data-directory lock is now an OS flock(2) held
   by a holder process (no takeover race, no /proc inference, survives SIGKILL

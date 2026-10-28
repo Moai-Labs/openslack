@@ -403,3 +403,99 @@ test("the persistence check refuses a non-empty data directory and never touches
   assert.equal(fs.readFileSync(path.join(dir, "messages.jsonl"), "utf8"), sentinel, "messages.jsonl untouched");
   assert.equal(fs.readdirSync(dir).sort().join(","), before, "nothing added or removed");
 });
+
+// ---- directory fsync fault injection ----
+// A rename is not durable until the containing directory entry is committed;
+// fsyncDir is where that is enforced. These tests inject storage failures on
+// directory descriptors only — real file fsyncs and opens still run — and
+// prove a failure is never swallowed into a successful acknowledgement.
+
+// Makes every directory fsync fail with the given code until restored.
+function failDirFsync(code) {
+  const realFsync = fs.fsyncSync;
+  fs.fsyncSync = (fd) => {
+    if (fs.fstatSync(fd).isDirectory()) {
+      const err = new Error(`injected ${code} on directory fsync`);
+      err.code = code;
+      throw err;
+    }
+    return realFsync(fd);
+  };
+  return () => { fs.fsyncSync = realFsync; };
+}
+
+// Makes opening any directory fail with the given code until restored.
+function failDirOpen(code) {
+  const realOpen = fs.openSync;
+  fs.openSync = (p, flags, mode) => {
+    let st = null;
+    try { st = fs.statSync(p); } catch { /* let the real open report it */ }
+    if (st && st.isDirectory()) {
+      const err = new Error(`injected ${code} on directory open`);
+      err.code = code;
+      throw err;
+    }
+    return realOpen(p, flags, mode);
+  };
+  return () => { fs.openSync = realOpen; };
+}
+
+const messageFor = (id) => ({
+  id: String(id), wsId: "ws-fsync", chId: "ch-fsync", userId: "u-fsync",
+  handle: "tester", text: "fault injection message " + id, at: new Date().toISOString()
+});
+
+test("an EIO from the directory commit stops a save from being acknowledged", () => {
+  const s = freshStore();
+  const a = s.createUser("faultowner", "long enough password");
+  const restore = failDirFsync("EIO");
+  assert.throws(() => s.createWorkspace(a, "EIO Workspace"), /EIO/, "the save throws instead of acknowledging an uncommitted rename");
+  restore();
+  // Once the storage fault is gone, the very same operation succeeds.
+  const ws = s.createWorkspace(a, "EIO Workspace");
+  assert.ok(ws.id, "the store recovers and works after the fault clears");
+});
+
+test("on Linux even EINVAL from the directory commit propagates: durability is never silently downgraded", (t) => {
+  if (process.platform !== "linux") {
+    t.skip("the unsupported-platform tolerance only exists off Linux");
+    return;
+  }
+  const s = freshStore();
+  const a = s.createUser("faultowner2", "long enough password");
+  const restore = failDirFsync("EINVAL");
+  assert.throws(() => s.createWorkspace(a, "EINVAL Workspace"), /EINVAL/, "a filesystem refusing directory fsync is not treated as 'unsupported platform'");
+  restore();
+});
+
+test("a directory-open failure propagates out of the save path", () => {
+  const s = freshStore();
+  const a = s.createUser("faultowner3", "long enough password");
+  const restore = failDirOpen("EIO");
+  assert.throws(() => s.createWorkspace(a, "Open Fault Workspace"), /EIO/);
+  restore();
+  s.createWorkspace(a, "Open Fault Workspace"); // recovers after the fault clears
+});
+
+test("a failed directory commit leaves the message neither on the acknowledged log nor in memory", () => {
+  const s = freshStore();
+  fs.rmSync(s.logPath, { force: true }); // the next append creates the log: its directory entry needs committing
+  const restore = failDirFsync("EIO");
+  assert.throws(() => s.appendMessage(messageFor(1)), /EIO/, "a newly created log whose directory entry cannot be committed is not acknowledged");
+  restore();
+  assert.equal(s.messages.length, 0, "the uncommitted message is not in memory either");
+  s.appendMessage(messageFor(1)); // with the fault gone, the append is acknowledged
+  assert.equal(s.messages.length, 1, "the store accepts the message once the directory commit works");
+});
+
+test("a failed directory commit on log compaction leaves the in-memory state untouched", () => {
+  const s = freshStore();
+  s.appendMessage(messageFor(1));
+  s.appendMessage(messageFor(2));
+  const restore = failDirFsync("EIO");
+  assert.throws(() => s.saveLog(s.messages.slice(0, 1)), /EIO/, "compaction whose rename cannot be committed is not acknowledged");
+  assert.equal(s.messages.length, 2, "the unacknowledged rewrite did not shrink the in-memory state");
+  restore();
+  s.saveLog(s.messages.slice(0, 1));
+  assert.equal(s.messages.length, 1, "compaction succeeds once the directory commit works");
+});

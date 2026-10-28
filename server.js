@@ -8,21 +8,12 @@ const path = require("node:path");
 const { Store } = require("./lib/store");
 const { Api, sendJson } = require("./lib/api");
 const { acquire } = require("./lib/lock");
+const { isSeparateMount } = require("./lib/durable");
 const pages = require("./lib/pages");
 const LIMITS = require("./lib/limits");
 
 const PORT = process.env.PORT != null && process.env.PORT !== "" ? Number(process.env.PORT) : 3000;
 const isProduction = process.env.NODE_ENV === "production";
-
-// Is this path on a filesystem of its own — i.e. a mounted volume rather than
-// the container's own writable layer, which vanishes with the container?
-function isSeparateMount(p) {
-  try {
-    return fs.statfsSync(p).dev !== fs.statfsSync(path.parse(p).root).dev;
-  } catch {
-    return false;
-  }
-}
 
 // The data directory holds everything that must survive a redeploy. In the
 // deployed image it is the mounted volume named by DATA_DIR (deploy.json).
@@ -155,7 +146,7 @@ beat.unref();
 sweep.unref();
 
 server.listen(PORT, () => {
-  console.log(`listening on ${PORT}, data in ${dataDir} (${durable ? "persistent volume" : "NOT durable: local storage"})`);
+  console.log(`listening on ${server.address().port}, data in ${dataDir} (${durable ? "persistent volume" : "NOT durable: local storage"})`);
 });
 
 async function shutdown() {

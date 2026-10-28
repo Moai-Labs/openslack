@@ -34,20 +34,25 @@ function show(sel, on) {
 // A pending invitation survives sign-up in sessionStorage. It is cleared only
 // once the join succeeded or the server explicitly refused it (invalid link,
 // workspace full); a network failure or a server crash keeps it pending so a
-// later visit still resumes it.
-async function resumePendingInvite(onError) {
+// later visit — or the retry button — still resumes it. `report` is called
+// with (message, retryable): retryable means the token is still pending and
+// trying again may work.
+async function resumePendingInvite(report) {
   const token = sessionStorage.getItem("pendingInvite");
-  if (!token) return false;
+  if (!token) return "none";
   try {
     const joined = await api(`/api/invites/${encodeURIComponent(token)}/join`, { method: "POST" });
     sessionStorage.removeItem("pendingInvite");
     location.href = `/w/${joined.slug}`;
-    return true;
+    return "joined";
   } catch (err) {
-    if (err instanceof TypeError || (err.status >= 500 && err.status < 600)) return false; // still pending
+    if (err instanceof TypeError || (err.status >= 500 && err.status < 600)) {
+      if (report) report(`We could not complete your invitation just now${err.message ? `: ${err.message}` : ""}. It is saved — try again.`, true);
+      return "retry";
+    }
     sessionStorage.removeItem("pendingInvite"); // refused: invalid link, full workspace, signed out
-    if (onError) onError(`Your invitation could not be completed: ${err.message}`);
-    return false;
+    if (report) report(`Your invitation could not be completed: ${err.message}`, false);
+    return "refused";
   }
 }
 
@@ -101,8 +106,23 @@ function initHome() {
     show("#dash", !!me.user);
     if (!me.user) return;
     $("#hello").textContent = `@${me.user.handle}`;
-    // An invitation followed us through sign-up or sign-in: complete it now.
-    await resumePendingInvite(setError);
+    // An invitation followed us through sign-up or sign-in: complete it now,
+    // in a place the signed-in visitor can actually see — the auth box with
+    // its error line is gone at this point.
+    const issue = $("#invite-issue");
+    const showIssue = (msg, retryable) => {
+      $("#invite-issue-text").textContent = msg;
+      $("#invite-retry").hidden = !retryable;
+      issue.classList.remove("hidden");
+    };
+    $("#invite-retry").onclick = async () => {
+      $("#invite-retry").disabled = true;
+      const state = await resumePendingInvite(showIssue);
+      if (state === "joined" || state === "none") issue.classList.add("hidden");
+      $("#invite-retry").disabled = false;
+    };
+    const state = await resumePendingInvite(showIssue);
+    if (state === "joined" || state === "none") issue.classList.add("hidden");
     const list = $("#ws-list");
     list.textContent = "";
     if (!me.workspaces.length) {
@@ -196,7 +216,19 @@ function initChat() {
   const render = (m, channel) => {
     if (searchView || channel !== current) return;
     if (log.querySelector(`[data-id="${m.id}"]`)) return;
-    log.append(msgNode(m));
+    // Insert in id order: a recovered gap must slot in before newer messages
+    // that were already rendered, never after them.
+    const node = msgNode(m);
+    const id = Number(m.id);
+    for (const child of log.children) {
+      const cid = Number(child.dataset && child.dataset.id);
+      if (Number.isFinite(cid) && cid > id) {
+        log.insertBefore(node, child);
+        log.scrollTop = log.scrollHeight;
+        return;
+      }
+    }
+    log.append(node);
     log.scrollTop = log.scrollHeight;
   };
 
@@ -433,9 +465,11 @@ function initChat() {
     try {
       const req = await api(`/api/ws/${slug}/pay-test/start`, { method: "POST" });
       $("#pay-details").textContent =
-        `TEST payment — ${req.amountUsdc} test-USDC (this is a labelled test, zero revenue; real payments are not accepted yet).\n` +
-        `Send exactly ${req.amountRaw} raw units (${req.amountUsdc} USDC, 6 decimals) of the USDC contract ${req.asset}\n` +
-        `on ${req.chainName} (chain id ${req.chainId}) to ${req.recipient}, then paste the transaction hash below.`;
+        `TEST payment — $12 in test-USDC (this is a labelled test, zero revenue; real payments are not accepted yet).\n` +
+        `Send exactly ${req.amountUsdc} test-USDC of the USDC contract ${req.asset} on ${req.chainName} (chain id ${req.chainId})\n` +
+        `to this request's own payment address ${req.recipient}, then paste the transaction hash below.\n` +
+        `Each request gets its own address, so your transfer can only ever pay this request — and only a transfer\n` +
+        `sent after the request was created can confirm it.`;
       $("#pay-error").textContent = "";
       $("#pay-tx").value = "";
       $("#pay-tx").dataset.intentId = req.intentId;

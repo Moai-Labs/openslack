@@ -24,24 +24,40 @@ direction requires. The product enforces these in code (`lib/limits.js`); tests 
   **25 members** and history kept searchable for **365 days** (instead of the free
   tier's 30 days).
 - **How a test payment is verified.** The owner opens a payment request in the
-  product, which shows exactly what to send: **12 test-USDC** (12,000,000 raw
+  product, which shows exactly what to send: **$12 in test-USDC, plus the
+  request's own payment address** — exactly 12 test-USDC (12,000,000 raw
   units, 6 decimals) of Circle's USDC contract
   `0x036CbD53842c5426634e7929541eC2318f3dCF7e` on **Base Sepolia** (chain id
-  84532), to the workspace's payment address. The owner sends that transfer from
-  any wallet and pastes the transaction hash; the server then verifies the
-  receipt read-only through a public JSON-RPC node — the chain id, the asset
-  contract (its code is checked to exist on that chain), the recipient, the exact
-  amount, and that the transaction settled (receipt status success, transfer log
-  present and not reorged away). Only a
-  verified, settled transfer grants anything; an unmined or reverted one leaves
-  the workspace on the free tier with a clear error, and the request stays open
-  for a retry.
+  84532). Every request is bound to its **own non-reusable payment address**,
+  derived from the request's id alone (no key material is involved, so funds
+  sent there are by design unrecoverable — one more reason these transfers are
+  labelled tests worth nothing), so the transfer that satisfies one request can
+  never be claimed for any other request, at any time, in any state. The owner
+  sends that transfer from any wallet and pastes the transaction hash; the
+  server then verifies the receipt read-only through a public JSON-RPC node —
+  the chain id, the asset contract (its code is checked to exist on that
+  chain), the recipient, the exact amount, that the transaction settled
+  (receipt status success, transfer log present and not reorged away), and
+  that the transfer was mined in a block **strictly after the chain block the
+  node reported when the request was created** — a chain-derived creation
+  boundary, not a server-clock guess, so nobody's historical transfer can
+  confirm anything and no clock skew opens an allowance for old transfers. Only a
+  verified, settled transfer grants anything; an unmined, reverted, foreign or
+  too-old one leaves the workspace on the free tier with a clear error, and the
+  request stays open for a retry.
 - **These payments are labelled tests.** Every record is kind `test` and counts as
   **zero revenue**: the tokens on the test chain have no value and no real money
   moves. The tier line in the product always says "test payment".
-- **One transfer, one entitlement.** The verified transaction hash is stored with
-  the payment and is refused if it was ever used before, in any workspace, so
-  replaying it cannot grant a second entitlement.
+- **One transfer, one entitlement.** The verified transaction hash is recorded
+  in a consumed-transfer ledger that is kept apart from the per-workspace
+  payment records and survives workspace deletion (it names no person and no
+  workspace). A hash is refused if it ever funded a payment, in any workspace —
+  even if that workspace was deleted afterwards, and even if the chain later
+  presents the same transaction at a different block position. Deletion of a
+  confirmation that is still being verified grants nothing: the workspace,
+  owner and open request are re-checked immediately before anything is
+  committed, and the request is consumed and the transfer recorded as one
+  indivisible step, so two concurrent confirmations can never both win.
 - **Real payments stay blocked** until a supported checkout with verified settlement
   exists. There is no way to pay real money in this version.
 - The entitlement is per workspace, starts when the transfer verifies, and

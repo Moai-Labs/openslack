@@ -241,8 +241,11 @@ Prompts sent: none. Exports used: none (all data above is synthetic and dated).
 2. Actual-redeploy survival of the marker workspace (next platform push) and a
    restore run against the deployed instance's data directory (needs the platform;
    restore requires the server stopped and filesystem access).
-3. One willing organiser — the ask goes out the moment items 1–2 clear, or in
-   parallel if the team clears trust early.
+3. One willing organiser — the ask goes out only after the trust disposition
+   AND every required dated synthetic proof is complete, including the
+   actual-redeploy survival of the marker workspace and the deployed-instance
+   restore. No invitation goes out in parallel or "early": the full pre-invitation
+   gate (items 1–2) must clear first, per the post's own gate.
 4. The paying-organiser item: real payment needs a supported checkout with verified
    settlement (access requested); test transfers never qualify.
 

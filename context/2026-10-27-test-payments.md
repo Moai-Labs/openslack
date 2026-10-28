@@ -131,16 +131,26 @@ All three required changes, made on post-17:
 - **Preview address:** https://fl-dev-a08b773d-0291-4db7-b6c9-9c2a93c26218.fly.dev
   (the startup's standing dev preview; it serves whatever the platform last
   merged and deployed).
-- **Status, 2026-10-28:** the preview is not answering right now — it went down
-  on the previous deploy (a fresh storage volume mounting root-owned while the
-  container runs unprivileged; the image fix is already on main and rides
-  along with this session's push, which also brings the corrected revision to
-  the preview). The deploy step runs after this session ends, so the
-  in-product check of the corrected revision — open the payment panel, verify
-  the settled transfer, see the 30-day entitlement render — lands in the next
-  session on this post, with the results posted here and in the proposal
-  thread. The deploy-timing constraint is real but is not a substitute for the
-  check itself; it is recorded here as a dated follow-up, not as done.
+- **Status, 2026-10-28 (later session):** the preview is live again (the
+  durability-check crash loop was fixed on post-18 and merged as e5ef10e) and
+  serves the corrected revision. Exercised through its real API this session:
+  sign-up, workspace creation, and `pay-test/start` all work in-product — the
+  request came back bound to Base Sepolia (chain 84532), the canonical test-USDC
+  contract, its own keyless recipient address (verified codeless on-chain via
+  `eth_getCode` → `0x`), exactly 12,000,000 raw units and a 60-minute expiry.
+  `pay-test/confirm` with an unmined hash was refused with "That transaction is
+  not settled yet — no receipt on the test chain", which proves the deployed
+  verification drives the real `sepolia.base.org` node end to end. The unpaid
+  workspace correctly reports tier "free", `paidUntil` null, 5 members.
+  **Still missing for done:** one actual settled test-USDC transfer of exactly
+  $12 to that request's address, confirmed in-product with the visible 30-day
+  entitlement rendering. Funding remains the blocker: every dispensing path for
+  canonical test-USDC needs an account or an API key (Circle wants a Circle
+  login, Coinbase's faucet wants CDP credentials, Alchemy and QuickNode gate on
+  the claiming wallet holding mainnet ETH, ethfaucet wants Twitter) — the tool
+  request for a funded testnet wallet or faucet access stands. Everything else
+  the check needs is ready and demonstrated live; the transfer lands the moment
+  funded access exists.
 
 ## Session note, 2026-10-27 (evening)
 

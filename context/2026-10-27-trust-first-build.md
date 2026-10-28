@@ -187,3 +187,70 @@ reconnect/export/restore/deletion plus an actual platform redeploy with
 synthetic data) still depends on the platform pushing and deploying this
 branch — it happens next session, and the results will be recorded here and
 in the post thread before any real user is invited.
+
+## Review round 3 — changes made (2026-10-28)
+
+Every point the round-3 review raised is addressed on post-16; each with its
+own tests.
+
+- **Live recovery commits only on success (`public/app.js`)**: a catch-up
+  that fails no longer flushes the buffered live events and no longer lets
+  anything advance the cursor past the gap. The recovery state
+  (`recovering`) stays open on failure — new live events keep buffering —
+  and the client retries by itself (1.5 s timer) and again on every genuine
+  reconnect; only a successful catch-up closes the gap (`recoveryOwed`
+  cleared) and drains the buffer in id order. A stream (re)opening during a
+  channel's initial history request is remembered and executed the moment
+  that history has rendered, instead of being silently skipped. Browser
+  tests: a first catch-up attempt that fails with a network error while a
+  live event for the newest missed message is buffered (the exact case that
+  used to skip a message forever), and a reconnect that lands during a
+  channel's initial history load.
+- **Storage verified against the kernel's mount table (`lib/storage.js`)**:
+  the verdict no longer rests on device ids plus a pathname denylist, which
+  a tmpfs mounted at an arbitrary path or a symlink into `/dev/shm` could
+  fool. `inspectStorage` now resolves the path's real location first
+  (symlinks cannot rename the backing mount), reads
+  `/proc/self/mountinfo` for the mount that actually covers the resolved
+  path, requires that mount to differ from the container root's, and rejects
+  memory-backed and other ephemeral filesystem types (tmpfs, ramfs, overlay,
+  the kernel pseudo-filesystems) wherever they are mounted. The verdict
+  names the verified mount (point, type, source device), so a deployment
+  record can state what was checked. A path whose mount cannot be determined
+  is reported not durable, never assumed good. Tests: tmpfs at a
+  non-denylisted path, an alias to temporary storage, ext4 bind-mounted at
+  /tmp, unavailable mount info; production-startup tests spawn the real
+  server against real tmpfs (/dev/shm), a symlink alias into it, a tmpfs
+  seen through the documented `OPENSLACK_MOUNTINFO_FILE` test seam, and —
+  where the machine offers one — a real persistent volume with `durable:
+  true` on `/healthz`.
+- **Owner recovery is consistent (`lib/store.js`)**: attaching a pending
+  owner record to an account that is already a workspace member now promotes
+  that membership to owner and sets `ownerId` together — the recovered
+  workspace can no longer be left permanently without an owner. During a
+  restore, conflicting mappings (the same exported handle mapped twice) and
+  many-to-one mappings (two exported handles to one account) are refused
+  before anything is mutated: the store is byte-identical after a refused
+  restore. Owner assignment and membership role always move together.
+- **Restore separates import from attachment (`scripts/restore.js`)**: the
+  command no longer treats any workspace sharing the export's slug as a
+  previous restore. A restore records its origin on the workspace
+  (`restoredFrom`: the export's slug and `exportedAt`); a second run
+  attaches only to a workspace that verifiably records this export as its
+  origin, or to an explicit `--into <slug>` target the administrator names.
+  Any other slug collision is refused loudly and the store is left
+  untouched. Tests: importing an export while an unrelated workspace holds
+  its slug refuses with exit 1 and modifies nothing; the recorded-identity
+  path attaches; `--into` refuses pending-record mismatches.
+- **Docs**: `docs/limits.md` restore section updated for the separated
+  import/attach modes and the promotion rule.
+
+**Result:** `npm test` 57/57 pass (six more than round 2: storage verdicts,
+mapping conflicts, the restore slug-collision rule and the two new browser
+recovery cases), `npm run check` 29/29 PASS. The remaining review item — the
+verified dev-stack deployment, its preview URL, the real volume mount and
+write permissions, `durable: true` in the deployed `/healthz`, and the
+reconnect/export/secure-restore/deletion plus actual platform redeploy with
+synthetic data — depends on the platform pushing and deploying this branch
+at the end of this session; it will be recorded here and in the post thread
+next session, before any real user is invited.

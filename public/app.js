@@ -165,9 +165,12 @@ function initChat() {
   let cursor = 0;
   let historyGen = 0; // bumped on every switch; stale history responses are dropped
   let channelReady = false; // the current channel's initial history has rendered
-  let recovering = null; // { channel, gen } while a reconnect catch-up is in flight
-  let pendingLive = []; // live events held while recovery (or the initial fill) is in flight
+  let streamOpen = false; // the SSE transport's state, kept honest for recovery decisions
+  let recoveryOwed = false; // the stream may have missed events; no successful catch-up has closed the gap yet
+  let recovering = null; // { channel, gen, active } while a catch-up attempt is open or awaiting retry
+  let pendingLive = []; // live events held while a gap is open (catch-up in flight or failed)
   let pendingInitial = []; // events that arrived before the first history rendered
+  let recoveryRetry = null; // timer for the next catch-up attempt after a failure
   let role = "member";
 
   const conn = $("#conn");
@@ -220,7 +223,9 @@ function initChat() {
 
   // Initial fill: the newest page of the channel's history. History rows carry
   // chId, not a channel name, so the requested channel is bound here and every
-  // response is checked against it before rendering.
+  // response is checked against it before rendering. When a recovery request
+  // was made while this history was loading (the stream opened or reopened
+  // mid-load), it is executed only now — never skipped.
   async function loadHistory(channel) {
     const gen = ++historyGen;
     channelReady = false;
@@ -233,16 +238,21 @@ function initChat() {
     channelReady = true;
     for (const m of pendingInitial.splice(0)) renderRow(m); // held live events, now in place
     log.scrollTop = log.scrollHeight;
+    if (recoveryOwed && streamOpen) catchUp(channel).catch(() => {});
   }
 
   // Catch up on everything missed while the stream was down, oldest first,
   // paginating from the recovery cursor until the server has nothing more.
-  // Each fetched page advances the cursor itself; live events arriving during
-  // the catch-up never do.
+  // The gap closes only when the whole catch-up succeeded: a failed attempt
+  // leaves the cursor and the buffered live events untouched and retries, so
+  // no message is ever skipped and no live event can advance past it. Each
+  // fetched page advances the cursor itself; live events arriving during the
+  // catch-up never do.
   async function catchUp(channel) {
-    if (!channelReady || channel !== current || recovering) return;
+    if (channel !== current || !channelReady) return;
+    if (recovering && recovering.active) return; // one attempt at a time
     const gen = historyGen;
-    recovering = { channel, gen };
+    recovering = { channel, gen, active: true };
     try {
       for (;;) {
         const data = await fetchHistory(channel, cursor, 50);
@@ -257,18 +267,30 @@ function initChat() {
         }
         if (missed.length < 50) break;
       }
-    } finally {
-      if (recovering && recovering.channel === channel && recovering.gen === gen && channel === current && gen === historyGen) {
-        recovering = null;
-        const held = pendingLive.splice(0).sort((a, b) => Number(a.id) - Number(b.id));
-        for (const m of held) accept(m);
+    } catch (err) {
+      // The gap stays open: keep buffering live events and retry shortly.
+      recovering = { channel, gen, active: false };
+      if (!recoveryRetry) {
+        recoveryRetry = setTimeout(() => {
+          recoveryRetry = null;
+          catchUp(current).catch(() => {});
+        }, 1500);
       }
+      return;
+    }
+    // Success is the only path that commits recovery and releases the buffer.
+    if (recovering && recovering.channel === channel && recovering.gen === gen && gen === historyGen && channel === current) {
+      recovering = null;
+      recoveryOwed = false;
+      const held = pendingLive.splice(0).sort((a, b) => Number(a.id) - Number(b.id));
+      for (const m of held) accept(m);
     }
   }
 
   async function switchChannel(name) {
     historyGen++; // anything in flight for the old channel is now stale
     recovering = null;
+    if (recoveryRetry) { clearTimeout(recoveryRetry); recoveryRetry = null; }
     current = name;
     cursor = 0;
     pendingLive = [];
@@ -288,10 +310,20 @@ function initChat() {
       ingest(m);
     });
     es.onopen = () => {
+      const wasOpen = streamOpen;
+      streamOpen = true;
       conn.textContent = "live"; conn.classList.add("live");
-      catchUp(current).catch(() => {}); // recover anything missed while away
+      if (!wasOpen) {
+        // A first connection or a reconnect may have missed events. If the
+        // channel's history is still loading, the recovery runs the moment
+        // that history has rendered — it is remembered, not skipped.
+        recoveryOwed = true;
+        if (channelReady) catchUp(current).catch(() => {});
+      }
     };
     es.onerror = () => {
+      streamOpen = false;
+      recoveryOwed = true;
       conn.textContent = "reconnecting…"; conn.classList.remove("live");
       es.close();
       setTimeout(connect, 1500); // EventSource reconnects on its own too; this keeps the label honest

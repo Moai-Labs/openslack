@@ -68,8 +68,10 @@ class FakeEventSource {
 }
 
 // A browser session against the real server: relative-URL fetch with a cookie
-// jar, navigation attempts recorded instead of performed.
-function browser(html, { url = `${base}/`, sid = null } = {}) {
+// jar, navigation attempts recorded instead of performed. `fetchWrapper` lets
+// a test intercept the client's fetches (to fail or delay them) while the
+// real network layer underneath stays untouched.
+function browser(html, { url = `${base}/`, sid = null, fetchWrapper = null } = {}) {
   const navigations = [];
   const vc = new VirtualConsole();
   vc.on("jsdomError", (e) => {
@@ -80,7 +82,7 @@ function browser(html, { url = `${base}/`, sid = null } = {}) {
 
   const jar = new Map();
   if (sid) jar.set("sid", sid);
-  win.fetch = async (p, opts = {}) => {
+  const rawFetch = async (p, opts = {}) => {
     const target = p.startsWith("http") ? p : base + p;
     const headers = { ...(opts.headers || {}) };
     if (jar.size) headers.cookie = [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
@@ -94,6 +96,7 @@ function browser(html, { url = `${base}/`, sid = null } = {}) {
     }
     return res;
   };
+  win.fetch = fetchWrapper ? (p, opts) => fetchWrapper(p, opts, rawFetch) : rawFetch;
 
   win.EventSource = FakeEventSource;
   win.confirm = () => true;
@@ -198,15 +201,19 @@ test("initial history renders, and reconnect catch-up recovers messages posted d
     "history rows (which carry chId, not channel) render for the requested channel"
   );
 
-  // Disconnect: the page stops receiving stream events while others post.
-  const es = FakeEventSource.last;
+  // Disconnect: the transport dies (onerror) while others post.
+  let es = FakeEventSource.last;
   await call("POST", `/api/ws/${slug}/channels/general/messages`, { text: "missed one" }, ownerCookie);
   await call("POST", `/api/ws/${slug}/channels/general/messages`, { text: "missed two" }, ownerCookie);
   await call("POST", `/api/ws/${slug}/channels/general/messages`, { text: "missed three" }, ownerCookie);
   await new Promise((r) => setTimeout(r, 100));
   assert.equal([...doc.querySelector("#log").children].filter((n) => n.textContent.includes("missed")).length, 0);
 
-  // Reconnect: on open the client catches up from its last displayed id.
+  // Reconnect: the client schedules a new stream, and on open it catches up
+  // from its last displayed id.
+  es.onerror();
+  await until(() => FakeEventSource.last !== es, "reconnect scheduled", 4000);
+  es = FakeEventSource.last;
   es.open();
   await until(
     () => [...doc.querySelector("#log").children].filter((n) => n.textContent.includes("missed")).length === 3,
@@ -238,7 +245,9 @@ test("initial history renders, and reconnect catch-up recovers messages posted d
   // rows, so 60 missed messages force more than one fetch; and a live event
   // that arrives while the catch-up is still running must wait for the gap
   // to be filled — never jump it or push the cursor past unseen rows.
-  es.close(); // the outage: nothing is delivered while these are posted
+  es.onerror(); // the outage: nothing is delivered while these are posted
+  await until(() => FakeEventSource.last !== es, "second reconnect scheduled", 4000);
+  es = FakeEventSource.last;
   const bulk = [];
   for (let i = 0; i < 20; i++) {
     for (const [ck, who] of [[ownerCookie, "owner"], [guestCookie, "guest"], [visitorCookie, "visitor"]]) {
@@ -266,6 +275,104 @@ test("initial history renders, and reconnect catch-up recovers messages posted d
   const ids3 = [...doc.querySelector("#log").children].map((n) => n.dataset.id);
   assert.deepEqual([...ids3].sort((a, b) => a - b), ids3, "recovered and buffered messages render in id order");
   assert.equal(new Set(ids3).size, ids3.length, "no duplicates across pages and buffered live events");
+  page.window.fetch = origFetch;
+  page.window.close();
+});
+
+test("a failed catch-up keeps the gap open: buffered live events wait and nothing is skipped", async () => {
+  const html = await (await fetch(`${base}/w/${slug}`)).text();
+  const page = browser(html, { url: `${base}/w/${slug}`, sid: guestCookie.split("=")[1] });
+  const doc = page.document;
+  await until(() => doc.querySelector("#log").children.length >= 1, "history rendered");
+
+  // Outage: two messages are posted while the client receives nothing.
+  let es = FakeEventSource.last;
+  const g1 = await call("POST", `/api/ws/${slug}/channels/general/messages`, { text: "failgap one" }, ownerCookie);
+  const g2 = await call("POST", `/api/ws/${slug}/channels/general/messages`, { text: "failgap two" }, ownerCookie);
+  es.onerror();
+  await until(() => FakeEventSource.last !== es, "reconnect scheduled", 4000);
+  es = FakeEventSource.last;
+
+  // The first catch-up attempt fails with a network error.
+  const origFetch = page.window.fetch;
+  let failedOnce = false;
+  page.window.fetch = (p, o, ...rest) => {
+    if (typeof p === "string" && p.includes("after=") && !failedOnce) {
+      failedOnce = true;
+      return Promise.reject(new TypeError("injected network failure"));
+    }
+    return origFetch(p, o, ...rest);
+  };
+  es.open();
+  // A live event for the NEWEST missed message arrives while the catch-up is
+  // failing. It must wait in the buffer: committing it would advance the
+  // cursor past "failgap one" and that message would be skipped forever.
+  es.emit(
+    "message",
+    JSON.stringify({ type: "message", id: g2.body.message.id, channel: "general", handle: "owner", text: "failgap two", at: g2.body.message.at })
+  );
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal([...doc.querySelector("#log").children].filter((n) => n.textContent.includes("failgap")).length, 0, "a failed catch-up commits nothing");
+
+  // The retry (scheduled by the client itself) succeeds once the network is
+  // back; the buffered live event is drained after the recovered rows.
+  page.window.fetch = origFetch;
+  await until(
+    () => [...doc.querySelector("#log").children].filter((n) => n.textContent.includes("failgap")).length === 2,
+    "retry closes the gap and drains the buffer",
+    6000
+  );
+  const ids = [...doc.querySelector("#log").children].map((n) => n.dataset.id);
+  assert.deepEqual([...ids].sort((a, b) => a - b), ids, "recovered and buffered messages render in id order");
+  assert.equal(new Set(ids).size, ids.length, "no duplicates between recovered rows and buffered live events");
+  page.window.close();
+});
+
+test("a stream that opens during a channel's initial history request is recovered once that history renders", async () => {
+  // a second channel so the switch below loads a fresh initial history
+  await call("POST", `/api/ws/${slug}/channels`, { name: "extra" }, ownerCookie);
+
+  const html = await (await fetch(`${base}/w/${slug}`)).text();
+  const page = browser(html, { url: `${base}/w/${slug}`, sid: guestCookie.split("=")[1] });
+  const doc = page.document;
+  await until(() => doc.querySelector("#log").children.length >= 1, "history rendered");
+  let es = FakeEventSource.last;
+
+  // The next initial history request is held after the server answered it.
+  let release;
+  const gate = new Promise((r) => (release = r));
+  let gated = false;
+  const origFetch = page.window.fetch;
+  page.window.fetch = (p, o, ...rest) => {
+    if (typeof p === "string" && /\/messages\?limit=/.test(p) && !p.includes("after=") && !gated) {
+      gated = true;
+      return origFetch(p, o, ...rest).then((res) => gate.then(() => res));
+    }
+    return origFetch(p, o, ...rest);
+  };
+
+  // Switch channels: the initial history of #extra is now pending.
+  const extraBtn = [...doc.querySelectorAll("#channels button")].find((b) => b.textContent === "#extra");
+  extraBtn.click();
+  await new Promise((r) => setTimeout(r, 100));
+
+  // A message arrives for #extra while its history is still loading.
+  await call("POST", `/api/ws/${slug}/channels/extra/messages`, { text: "late arrive" }, ownerCookie);
+
+  // The stream dies and reopens while the history is pending: the recovery
+  // request must be remembered, not skipped.
+  es.onerror();
+  await until(() => FakeEventSource.last !== es, "reconnect scheduled during the initial history", 4000);
+  es = FakeEventSource.last;
+  es.open();
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal([...doc.querySelector("#log").children].filter((n) => n.textContent.includes("late arrive")).length, 0, "nothing before the history renders");
+
+  // The history completes — and only now is the remembered recovery executed.
+  release();
+  await until(() => [...doc.querySelector("#log").children].some((n) => n.textContent.includes("late arrive")), "recovery after the initial history", 4000);
+  const ids = [...doc.querySelector("#log").children].map((n) => n.dataset.id);
+  assert.equal(new Set(ids).size, ids.length, "no duplicates");
   page.window.fetch = origFetch;
   page.window.close();
 });

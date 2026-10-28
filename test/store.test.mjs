@@ -411,8 +411,75 @@ test("a failed attachment keeps the pending record, across saves and restarts", 
   assert.throws(() => s3.attachMember(ws3, "alice", { id: "no-such-user" }), /does not exist/);
   assert.ok((s3.workspaceBySlug(ws2.slug).pendingMembers || []).some((p) => p.handle === "alice"));
 
-  // A member already attached stays attached when their record is consumed.
+  // A pending owner record attached to an account that is already a member
+  // makes that account the owner — in the membership and in ownerId — so the
+  // recovered workspace is never left permanently without an owner.
   s3.attachMember(ws3, "alice", extra[0]);
-  assert.equal(s3.membership(ws3.id, extra[0].id).role, "member", "the workspace already has an owner, so the role stays member");
+  assert.equal(s3.membership(ws3.id, extra[0].id).role, "owner", "the verified identity takes over the exported owner role");
+  assert.equal(s3.workspaceBySlug(ws2.slug).ownerId, extra[0].id, "ownerId is set together with the promoted membership");
   assert.deepEqual((s3.workspaceBySlug(ws2.slug).pendingMembers || []).map((p) => p.handle), ["bob"]);
+});
+
+test("conflicting or many-to-one attach mappings abort a restore before anything is mutated", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-conflict-"));
+  const s1 = new Store(dir).init();
+  const a = s1.createUser("alice", "longenough1");
+  const b = s1.createUser("bob", "longenough1");
+  const ws = s1.createWorkspace(a, "Conflicts");
+  s1.joinWorkspace(ws, b);
+  s1.postMessage(ws, s1.channelByName(ws.id, "general"), a, "precious");
+  const exported = s1.buildExport(ws);
+
+  const s2 = new Store(fs.mkdtempSync(path.join(os.tmpdir(), "openslack-conflict-"))).init();
+  s2.createUser("alice", "another password");
+  const u2 = s2.createUser("dup", "another password");
+  const before = JSON.stringify(JSON.parse(fs.readFileSync(s2.dbPath, "utf8")));
+  const logBefore = fs.readFileSync(s2.logPath, "utf8");
+
+  // The same exported handle mapped twice is a contradiction.
+  assert.throws(
+    () => s2.restoreExport(exported, { attach: [{ exportHandle: "alice", userId: u2.id }, { exportHandle: "alice", userId: u2.id }] }),
+    /mapped more than once/,
+    "a duplicate exportHandle mapping is refused"
+  );
+  // Two exported handles mapped to one account is a many-to-one mapping.
+  const dupExport = { ...exported, members: [...exported.members, { handle: "alicia", role: "member", joinedAt: null }] };
+  assert.throws(
+    () => s2.restoreExport(dupExport, { attach: [{ exportHandle: "alice", userId: u2.id }, { exportHandle: "alicia", userId: u2.id }] }),
+    /more than one exported handle/,
+    "a many-to-one mapping is refused"
+  );
+  // A mapping to an account that does not exist is refused too.
+  assert.throws(() => s2.restoreExport(exported, { attach: [{ exportHandle: "alice", userId: "no-such-user" }] }), /does not exist/);
+
+  // Nothing was written: no workspace, no membership, no message.
+  assert.equal(JSON.stringify(JSON.parse(fs.readFileSync(s2.dbPath, "utf8"))), before, "the store is unchanged after refused mappings");
+  assert.equal(fs.readFileSync(s2.logPath, "utf8"), logBefore, "the log is unchanged after refused mappings");
+
+  // A clean, one-to-one mapping still restores normally.
+  const a2 = s2.createUser("carol", "another password");
+  const ok = s2.restoreExport(dupExport, { attach: [{ exportHandle: "alicia", userId: a2.id }] });
+  assert.equal(ok.ownerId, null, "no owner was assigned from the refused mappings");
+  assert.deepEqual((ok.pendingMembers || []).map((p) => p.handle).sort(), ["alice", "bob"]);
+});
+
+test("a restored workspace records where it came from, so a later attach run can verify it", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-origin-"));
+  const s1 = new Store(dir).init();
+  const a = s1.createUser("alice", "longenough1");
+  const ws = s1.createWorkspace(a, "Origin");
+  s1.postMessage(ws, s1.channelByName(ws.id, "general"), a, "hello");
+  const exported = s1.buildExport(ws);
+  const s2 = new Store(fs.mkdtempSync(path.join(os.tmpdir(), "openslack-origin-"))).init();
+  const ws2 = s2.restoreExport(exported);
+  assert.deepEqual(ws2.restoredFrom, {
+    slug: exported.workspace.slug,
+    name: exported.workspace.name,
+    ownerId: exported.workspace.ownerId,
+    createdAt: exported.workspace.createdAt,
+    exportedAt: exported.exportedAt
+  }, "the restored workspace carries the export's identity");
+  // The marker lives on the store's workspace, not in exports: a re-export
+  // stays a plain openslack-export-v1 snapshot.
+  assert.equal(JSON.stringify(s2.buildExport(ws2)).includes("restoredFrom"), false);
 });

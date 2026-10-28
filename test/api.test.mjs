@@ -184,6 +184,72 @@ test("export, delete, restore path over the API", async () => {
   assert.equal((ws2.pendingMembers || []).map((p) => p.handle).sort().join(","), "guest,member0,member1,member2", "unattached exported members stay pending");
 });
 
+test("the restore command never mistakes an unrelated workspace for a restore of the same slug", async () => {
+  const { Store } = await import("../lib/store.js");
+  const runRestore = (dataDir, args) => {
+    try {
+      return {
+        code: 0,
+        out: execFileSync(process.execPath, [path.join(ROOT_SERVER, "scripts", "restore.js"), ...args], {
+          env: { ...process.env, DATA_DIR: dataDir },
+          encoding: "utf8",
+          timeout: 20000
+        })
+      };
+    } catch (err) {
+      return { code: err.status, out: String(err.stdout || ""), err: String(err.stderr || err.message) };
+    }
+  };
+  const exportBody = (slug) => JSON.stringify({
+    format: "openslack-export-v1",
+    exportedAt: "2026-10-27T12:00:00.000Z",
+    workspace: { slug, name: "Collide", ownerId: "u1", createdAt: "2026-10-01T00:00:00.000Z" },
+    members: [{ handle: "alice", role: "owner", joinedAt: null }],
+    channels: [{ name: "general", topic: "", createdAt: "2026-10-01T00:00:00.000Z" }],
+    messages: [{ id: "1", channel: "general", handle: "alice", text: "from the export", at: "2026-10-02T00:00:00.000Z" }]
+  });
+
+  // An unrelated workspace already holds the export's slug.
+  const collDir = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-restore-collide-"));
+  const pre = new Store(collDir).init();
+  const owner = pre.createUser("stranger", "longenough1");
+  pre.createWorkspace(owner, "Collide"); // takes the slug "collide"
+  const dbBefore = fs.readFileSync(path.join(collDir, "db.json"), "utf8");
+  const logBefore = fs.readFileSync(path.join(collDir, "messages.jsonl"), "utf8");
+
+  const expFile = path.join(os.tmpdir(), `openslack-collide-export-${process.pid}.json`);
+  fs.writeFileSync(expFile, exportBody("collide"));
+  const refused = runRestore(collDir, [expFile]);
+  assert.equal(refused.code, 1, "the collision is refused, not silently ignored");
+  assert.match(refused.err, /Refusing to guess|already exists/, refused.err.slice(0, 200));
+  assert.equal(fs.readFileSync(path.join(collDir, "db.json"), "utf8"), dbBefore, "the unrelated workspace is untouched");
+  assert.equal(fs.readFileSync(path.join(collDir, "messages.jsonl"), "utf8"), logBefore, "no messages were imported behind the refusal");
+
+  // --into names an explicit target: the operator's call, the command proceeds.
+  const into = runRestore(collDir, [expFile, "--into", "collide", "--attach", "alice=stranger"]);
+  assert.equal(into.code, 1, "attaching to a workspace with no such pending record is refused, not guessed");
+  assert.match(into.err, /No pending member/, into.err.slice(0, 200));
+
+  // A free slug imports normally; a second run of the same export attaches.
+  const fresh = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-restore-fresh-"));
+  const first = runRestore(fresh, [expFile]);
+  assert.equal(first.code, 0, first.err && first.err.slice(0, 200));
+  assert.match(first.out, /restored:/);
+  const second = runRestore(fresh, [expFile, "--attach", "alice=alice2"]);
+  assert.equal(second.code, 1, "the verified account must exist first");
+  assert.match(second.err, /no account/);
+  const mk = new Store(fresh).init();
+  mk.createUser("alice2", "longenough1");
+  const third = runRestore(fresh, [expFile, "--attach", "alice=alice2"]);
+  assert.equal(third.code, 0, third.err && third.err.slice(0, 200));
+  assert.match(third.out, /attached:/, "the recorded restoration identity admits the second run as an attach");
+  const store = new Store(fresh).init();
+  const ws = store.workspaceBySlug("collide");
+  assert.equal(store.workspaceBySlug("collide").ownerId, store.db.users.find((u) => u.handle === "alice2").id, "the attached owner owns the workspace");
+  assert.equal(ws.pendingMembers, undefined, "the pending record is consumed");
+  fs.rmSync(expFile, { force: true });
+});
+
 test("pages and static assets are served", async () => {
   const home = await fetch(`http://127.0.0.1:${port}/`);
   assert.match(await home.text(), /OpenSlack/);

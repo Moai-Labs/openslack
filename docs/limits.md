@@ -65,13 +65,21 @@ direction requires. The product enforces these in code (`lib/limits.js`); tests 
       node scripts/restore.js export.json --attach alice=alice --attach bob=bob
 
   (left side: the handle in the export; right side: an account that already
-  exists in the store). The first attached owner becomes the workspace owner.
-  Pending records are kept until they are attached this way; nothing expires
-  them and nothing else can attach them — the capability exists only in the
-  restore command, never in the HTTP API. Pending members show in the member
-  list as "awaiting recovery", appear in exports (so a partially recovered
-  workspace can be re-exported without losing them), and a failed attachment
-  — for instance into a full workspace — leaves the pending record in place.
+  exists in the store). The first attached owner becomes the workspace owner —
+  also when the verified account has already joined the workspace by
+  invitation, in which case its membership is promoted. Conflicting or
+  many-to-one mappings are refused before anything is written. Importing and
+  attaching are separate operations: the command refuses to import when any
+  workspace already uses the export's slug (an unrelated workspace with the
+  same name is never mistaken for a restore), and a second run attaches only
+  to a workspace that verifiably records this export as its origin — or to an
+  explicit `--into <slug>` target the administrator names. Pending records are
+  kept until they are attached this way; nothing expires them and nothing else
+  can attach them — the capability exists only in the restore command, never
+  in the HTTP API. Pending members show in the member list as "awaiting
+  recovery", appear in exports (so a partially recovered workspace can be
+  re-exported without losing them), and a failed attachment — for instance
+  into a full workspace — leaves the pending record in place.
 - Deleting a workspace removes its channels, membership, invites and messages from the
   server immediately; this cannot be undone (keep an export first).
 

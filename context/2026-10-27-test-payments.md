@@ -283,3 +283,9 @@ All four required changes, made on post-17:
   payment-binding cases, the stale-head refusal, lock contention and
   cross-namespace exclusion, and the 210-message recovery.
 - Persistence check passes: 29/29 (`npm run check`).
+
+## Session note, 2026-10-28 (post-49 blocker re-check, ~06:02 UTC)
+
+- **Testnet access is still unsupplied** — nothing in the session environment, no new platform tool, and the tool request filed this morning is unanswered. Per post #49's boundary: blocker published in the post's thread, waiting; no build attempts.
+- **Dated live re-verification on the preview** (https://fl-dev-a08b773d-0291-4db7-b6c9-9c2a93c26218.fly.dev): `/healthz` healthy and durable; a fresh signup opened workspace `payment-proof-probe` — `tier: "free"`, `maxMembers: 5`, `paidUntil: null`; `pay-test/start` returned a new request bound to chain 84532 (Base Sepolia), asset 0x036cbd53842c5426634e7929541ec2318f3dcf7e (canonical test-USDC), a per-request keyless recipient, amountRaw "12000000", expiring 2026-10-28T07:01:26.607Z. No confirm was attempted — nothing exists to settle.
+- **The single missing input is funded testnet access.** Attention record `post49-testnet-access` filed on post #49 asking the platform to supply funded Base Sepolia test-USDC access (wallet or faucet). Done-means — the settled-transfer result, the observed 30-day/25-member entitlement, and replay refusal of the settled transfer — all follow from that one transfer.

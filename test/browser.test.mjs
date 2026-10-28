@@ -17,6 +17,7 @@ import { JSDOM, VirtualConsole } from "jsdom";
 // payment flow (request, verify, entitlement) against these receipts.
 let chainId = "0x14a34"; // 84532 = Base Sepolia
 let assetCode = "0x6080"; // non-empty: the asset contract exists
+let headNumber = "0x30a3796"; // the chain head the node reports to payment start; receipts sit in a later block
 let receipts = new Map(); // txHash (lowercase) -> receipt object
 let blocks = new Map(); // blockNumber (lowercase) -> { timestamp } in seconds; unset blocks are "now"
 const fakeRpc = http.createServer((req, res) => {
@@ -27,6 +28,7 @@ const fakeRpc = http.createServer((req, res) => {
     let result = null;
     if (method === "eth_chainId") result = chainId;
     else if (method === "eth_getCode") result = assetCode;
+    else if (method === "eth_blockNumber") result = headNumber;
     else if (method === "eth_getTransactionReceipt") result = receipts.get(String(params[0]).toLowerCase()) ?? null;
     else if (method === "eth_getBlockByNumber") {
       const key = String(params[0]).toLowerCase();
@@ -297,7 +299,7 @@ test("owner tools appear for the owner and work; non-owners never see them", asy
 const TX = (n) => "0x" + String(n).padStart(2, "0") + "0".repeat(62); // unique per number
 // The receipt carries the exact amount an open payment request asked for —
 // that request's own unique amount is what the server verifies against.
-const receiptFor = (txHash, amountRaw = BigInt(LIMITS.PAID_PRICE_USDC) * 10n ** 6n) => {
+const receiptFor = (txHash, amountRaw = BigInt(LIMITS.PAID_PRICE_USDC) * 10n ** 6n, to) => {
   const pad = (a) => "0x" + "0".repeat(24) + a.toLowerCase().slice(2);
   return {
     blockHash: "0x" + "ab".repeat(32),
@@ -306,7 +308,7 @@ const receiptFor = (txHash, amountRaw = BigInt(LIMITS.PAID_PRICE_USDC) * 10n ** 
     logs: [
       {
         address: LIMITS.PAY_USDC_ADDRESS,
-        topics: [TRANSFER_TOPIC, pad("0x1111000000000000000000000000000000000001"), pad(LIMITS.PAY_RECIPIENT)],
+        topics: [TRANSFER_TOPIC, pad("0x1111000000000000000000000000000000000001"), pad(to)],
         data: "0x" + BigInt(amountRaw).toString(16).padStart(64, "0"),
         blockNumber: "0x30a3797",
         logIndex: "0x0",
@@ -335,29 +337,32 @@ test("an owner sees the test-payment control, completes the verified flow, and s
   await until(() => doc.querySelector("#pay-test-btn").hidden === false, "pay control revealed for the owner");
   assert.equal(doc.querySelector("#tier-info").textContent.includes("Free tier"), true, "starts on the free tier");
 
-  // step 1: the product shows the exact payment request, labelled as a test
+  // step 1: the product shows the exact payment request, labelled as a test —
+  // the request the panel itself opened, whose id and address it carries
   doc.querySelector("#pay-test-btn").onclick();
   await until(() => doc.querySelector("#pay-panel").hidden === false, "payment panel opened");
   const details = doc.querySelector("#pay-details").textContent;
   assert.match(details, /TEST payment/);
-  assert.match(details, new RegExp(LIMITS.PAY_RECIPIENT));
+  const shownRecipient = details.match(/payment address (0x[0-9a-f]{40})/i)[1]; // the request's own payment address
+  assert.ok(shownRecipient, "the panel shows the request's own payment address");
+  const shownIntentId = doc.querySelector("#pay-tx").dataset.intentId;
+  assert.ok(shownIntentId, "the panel holds the request it opened");
   assert.match(details, new RegExp(LIMITS.PAY_USDC_ADDRESS, "i"));
-  assert.match(details, /120000[0-9]{2}/, "the request's own exact raw amount is shown");
+  assert.match(details, /exactly 12 test-USDC/, "the exact price is shown");
   assert.match(details, /Base Sepolia/);
   assert.match(details, /zero revenue/);
 
   // step 2 with a hash the test chain has never seen: the product refuses and
   // explains, and nothing is granted
   receipts.delete(TX(70));
-  const start = await call("POST", `/api/ws/${paySlug}/pay-test/start`, null, payOwnerCookie);
-  doc.querySelector("#pay-tx").dataset.intentId = start.body.intentId;
   doc.querySelector("#pay-tx").value = TX(70);
   doc.querySelector("#form-pay").dispatchEvent(new page.window.Event("submit", { bubbles: true, cancelable: true }));
   await until(() => doc.querySelector("#pay-error").textContent.includes("not settled"), "unsettled hash explained in the product");
   assert.equal(doc.querySelector("#tier-info").textContent.includes("Free tier"), true, "still free after a failed verification");
 
-  // the real, settled transfer verifies and the entitlement appears
-  receipts.set(TX(70), receiptFor(TX(70), start.body.amountRaw));
+  // the real, settled transfer to the request's own address verifies and the
+  // entitlement appears
+  receipts.set(TX(70), receiptFor(TX(70), BigInt(LIMITS.PAID_PRICE_USDC) * 10n ** 6n, shownRecipient));
   doc.querySelector("#form-pay").dispatchEvent(new page.window.Event("submit", { bubbles: true, cancelable: true }));
   await until(() => doc.querySelector("#tier-info").textContent.includes("Paid tier (test payment)"), "paid tier shown");
   assert.match(doc.querySelector("#tier-info").textContent, /365-day history/);
@@ -514,7 +519,7 @@ test("seed: a paid workspace with ten posters", async () => {
   recSlug = ws.body.slug;
   // the paid tier holds the ten members the recovery test needs
   const start = await call("POST", `/api/ws/${recSlug}/pay-test/start`, null, recOwner);
-  receipts.set(TX(80), receiptFor(TX(80), start.body.amountRaw));
+  receipts.set(TX(80), receiptFor(TX(80), start.body.amountRaw, start.body.recipient));
   const pay = await call("POST", `/api/ws/${recSlug}/pay-test/confirm`, { intentId: start.body.intentId, txHash: TX(80) }, recOwner);
   assert.equal(pay.res.status, 200);
   const inv = await call("POST", "/api/invites", { slug: recSlug }, recOwner);
@@ -568,6 +573,74 @@ test("recovery behind an open search advances and terminates instead of spinning
   // back to the channel: it renders again, with the recovered messages
   doc.querySelector("#search-back").onclick();
   await until(() => [...doc.querySelector("#log").children].some((n) => n.textContent.includes("wave edge")), "back on the channel after search");
+  page.window.close();
+});
+
+// ---- a plain outage: more than a page of missed messages, no live event ----
+
+let recPosters2 = [];
+test("seed: ten more posters with fresh rate budgets", async () => {
+  const inv = await call("POST", "/api/invites", { slug: recSlug }, recOwner);
+  for (let i = 0; i < 10; i++) {
+    const c = cookieOf((await call("POST", "/api/signup", { handle: `recq${i}`, password: "longenough1" })).res);
+    assert.equal((await call("POST", `/api/invites/${inv.body.token}/join`, null, c)).res.status, 200);
+    recPosters2.push(c);
+  }
+});
+
+test("a reconnect after more than 200 missed messages recovers every one of them, with no live event to help", async () => {
+  const html = await (await fetch(`${base}/w/${recSlug}`)).text();
+  const page = browser(html, { url: `${base}/w/${recSlug}`, sid: recOwner.split("=")[1] });
+  const doc = page.document;
+  await until(() => doc.querySelector("#log").children.length >= 1, "initial history rendered");
+
+  // record every row the page pulls while catching up
+  const fetched = [];
+  const inner = page.window.fetch;
+  page.window.fetch = (p, opts) => {
+    const resPromise = inner(p, opts);
+    if (String(p).includes("/messages?after=")) {
+      return resPromise.then(async (res) => {
+        const body = await res.clone().json().catch(() => ({ messages: [] }));
+        for (const m of body.messages || []) fetched.push(Number(m.id));
+        return res;
+      });
+    }
+    return resPromise;
+  };
+
+  // the search is open before the outage is noticed, as the review describes
+  doc.querySelector('#form-search input[name="q"]').value = "outage wave";
+  doc.querySelector("#form-search").dispatchEvent(new page.window.Event("submit", { bubbles: true, cancelable: true }));
+  await until(() => doc.querySelector("#search-info").textContent.includes("match"), "search results shown");
+
+  // 210 messages arrive that the page never hears about — no live event is
+  // emitted afterwards, only a reconnect
+  for (let i = 0; i < 21; i++) {
+    for (const c of recPosters2) {
+      const r = await call("POST", `/api/ws/${recSlug}/channels/general/messages`, { text: `outage wave ${i} missed while away` }, c);
+      assert.equal(r.res.status, 201);
+    }
+  }
+  const lastMissed = recPosters2.length ? "outage wave 20 missed while away" : null;
+  FakeEventSource.last.open(); // the reconnect, with no subsequent live event
+
+  await until(() => fetched.length >= 210, "the missed messages were fetched");
+  await new Promise((r) => setTimeout(r, 700));
+  assert.equal(fetched.length, 210, "recovery stopped once the server had nothing more, and fetched nothing twice");
+
+  // every missed message, no gaps, no duplicates: exactly the ids between the
+  // last one the page held and the newest on the server
+  const sorted = [...fetched].sort((a, b) => a - b);
+  assert.equal(new Set(sorted).size, 210, "no duplicates");
+  for (let i = 1; i < sorted.length; i++) {
+    assert.equal(sorted[i], sorted[i - 1] + 1, `no gap in the recovered range at ${sorted[i - 1]} -> ${sorted[i]}`);
+  }
+  assert.equal(doc.querySelector("#search-bar").hidden, false, "the search stayed on screen throughout");
+
+  // back to the channel: the newest of the recovered messages is there
+  doc.querySelector("#search-back").onclick();
+  await until(() => [...doc.querySelector("#log").children].some((n) => n.textContent.includes(lastMissed)), "the newest missed message rendered after the search");
   page.window.close();
 });
 

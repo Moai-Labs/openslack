@@ -321,20 +321,20 @@ function initChat() {
   // The cursor is the recovery's own, not the render's: appending a live event
   // that revealed a gap must not move the cursor past the messages inside it,
   // and a search on screen (which defers rendering) must not stall it either.
-  // Each page advances the cursor to the newest id it actually fetched, so the
-  // loop always moves forward and always terminates. A newer recovery supersedes
-  // a running one at the next page boundary; the cursor carries over, so no
-  // range is skipped.
+  // Whether to keep going is decided by the page that just came back, never by
+  // the newest locally known id: a full page means more may exist on the
+  // server even when nothing newer has been seen locally, so a full page is
+  // always followed up, and a short or empty page ends the run. The cursor
+  // strictly advances on every non-empty page, so the loop always moves
+  // forward and always terminates. A newer recovery supersedes a running one
+  // at the next page boundary; the cursor carries over, so no range is skipped.
   function startRecovery(channel, fromId) {
     if (!channelReady) return; // the initial load has not set the cursors yet
     if (fromId != null) recoverFrom = Math.min(recoverFrom, Number(fromId)); // recover from before the gap
     const run = ++recoverRun;
     (async () => {
-      // The first page always fetches: a plain outage leaves messages the
-      // client never heard about, so no local cursor can say "nothing there".
-      for (let first = true; ; first = false) {
+      for (;;) {
         if (run !== recoverRun || channel !== current) return;
-        if (!first && recoverFrom >= lastId) return;
         const data = await fetchHistory(channel, recoverFrom, 200);
         if (run !== recoverRun || channel !== current) return;
         const missed = data.messages || [];
@@ -431,12 +431,12 @@ function initChat() {
     setError("");
     try {
       const req = await api(`/api/ws/${slug}/pay-test/start`, { method: "POST" });
-      const exact = (Number(req.amountRaw) / 10 ** 6).toFixed(6); // the request's own unique amount
       $("#pay-details").textContent =
         `TEST payment — $12 in test-USDC (this is a labelled test, zero revenue; real payments are not accepted yet).\n` +
-        `Send exactly ${req.amountRaw} raw units = ${exact} test-USDC (6 decimals) of the USDC contract ${req.asset}\n` +
-        `on ${req.chainName} (chain id ${req.chainId}) to ${req.recipient}, then paste the transaction hash below.\n` +
-        `The fraction beyond $12 is this request's own amount: it ties your transfer to this request and no other.`;
+        `Send exactly ${req.amountUsdc} test-USDC of the USDC contract ${req.asset} on ${req.chainName} (chain id ${req.chainId})\n` +
+        `to this request's own payment address ${req.recipient}, then paste the transaction hash below.\n` +
+        `Each request gets its own address, so your transfer can only ever pay this request — and only a transfer\n` +
+        `sent after the request was created can confirm it.`;
       $("#pay-error").textContent = "";
       $("#pay-tx").value = "";
       $("#pay-tx").dataset.intentId = req.intentId;

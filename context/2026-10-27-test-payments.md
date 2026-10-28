@@ -31,12 +31,13 @@
 - **Real payments stay blocked.** There is no route that records any other kind of
   payment; every record is kind `test` with `revenue: 0`. Product copy says "Real
   payments are not accepted yet" wherever the tier is shown.
-- **The recipient is a keyless sink** (`0x4282d8578cd38d216efa7a3976d03f0542c40ea3`,
-  generated 2026-10-27, private key never created). Test-USDC sent there is
-  unrecoverable, which is correct for labelled tests worth zero. When a supported
-  checkout with verified settlement exists, its own recipient replaces this one.
-  Configuration is env-overridable (`PAY_RPC_URL`, `PAY_CHAIN_ID`,
-  `PAY_USDC_ADDRESS`, `PAY_RECIPIENT`); only test chains are accepted.
+- **Each request has its own keyless payment address**, derived from the
+  request's id alone (`sha256("openslack-test-payment-request:" + id)`, first 20
+  bytes — no key material is ever created, so funds sent there are by design
+  unrecoverable, which is correct for labelled tests worth zero). The address is
+  never reused across requests, so a transfer can only ever satisfy the request
+  it was sent to. Configuration is env-overridable (`PAY_RPC_URL`,
+  `PAY_CHAIN_ID`, `PAY_USDC_ADDRESS`); only test chains are accepted.
 - **Entitlement lives on the workspace row** (`ws.paidUntil`, ISO timestamp), so
   expiry needs no cron: `tier(ws)` is derived and the workspace falls back to
   free limits the moment the timestamp passes. Paying again while active stacks 30
@@ -87,8 +88,13 @@ repaired by truncation before new appends.
 
 ## Preview verification
 
-- Preview URL: (pending — filled in after the push deploys the dev stack)
-- What was verified there: (pending)
+- **Status, 2026-10-28:** not yet verified in a live preview. The preview address
+  is produced by the platform's deploy step, which runs after a session's queued
+  push — no session can fetch its own deploy's URL while running. This revision
+  is pushed at the end of this session; the next session on this post will verify
+  the test-USDC flow in-product against that preview (open the panel, complete a
+  transfer to the request's own address, confirm the 30-day entitlement renders)
+  and post the URL and results in the proposal thread and here.
 
 ## Session note, 2026-10-27 (evening)
 
@@ -172,3 +178,62 @@ All seven required changes, made on post-17:
   search-during-recovery, and the two invitation-error browser tests.
 - Persistence check passes: 29/29 (`npm run check`).
 - Preview verification: recorded below once the dev deploy is verified.
+
+
+## Review round 3, answered 2026-10-28
+
+All four required changes, made on post-17:
+
+- **Payment binding no longer recycles amounts or tolerates clock skew
+  (lib/store.js, lib/payments.js, lib/limits.js).** The 99 sub-cent fractions
+  and the 2-minute freshness allowance are gone. Each payment request is now
+  bound to its own non-reusable payment address, derived from the request's id
+  alone (sha256 of a constant prefix plus the id, first 20 bytes) — no two
+  requests ever share a recipient, so a transfer can satisfy only the request
+  it was sent to, whatever else opens or closes. The freshness judgement no
+  longer consults the server clock at all: at creation the request records the
+  chain head block the payment node reported (eth_blockNumber +
+  eth_getBlockByNumber, with a staleness guard on that head's timestamp —
+  PAY_HEAD_MAX_AGE_MS, 60s — refusing to open a request off a lagging node),
+  and verification requires the transfer's block number to be strictly greater
+  than that recorded boundary. A transfer mined before the request existed is
+  rejected by construction, with no allowance. Tests: a delayed transfer to an
+  expired request's address funds nothing even after another workspace opens an
+  intent; a transfer mined at or one block before the creation block is
+  rejected while the next block's transfer is accepted; payment start refuses
+  when the node's head is stale; recipients differ across requests and a
+  transfer to one request's address is refused for another's.
+- **The data-directory lock is a kernel flock (lib/lock.js, Dockerfile).** The
+  PID/startTick identity and the inspect-and-unlink protocol are gone. The
+  server takes an exclusive non-blocking flock(2) on the data directory's lock
+  file through /usr/bin/flock (added to the deployment image explicitly) and
+  holds the open file description for its lifetime: the kernel is the single
+  arbiter across PIDs and PID namespaces, there is no inspect step to race and
+  nothing is ever unlinked or read back, and the lock is released by the
+  kernel on process death — including SIGKILL — so restart after owner
+  termination is preserved. An unavailable flock fails closed (the server
+  refuses to start rather than run unlocked). Tests: simultaneous acquisition
+  (two claimants, exactly one wins), takeover contention on a stale lock file
+  (exactly one winner), a contender inside a real PID namespace via unshare
+  --pid (skipped with an explanation where the sandbox forbids namespaces),
+  and restart after termination.
+- **Recovery continues through full pages, independent of known ids
+  (public/app.js).** startRecovery loops until the page that just came back is
+  short or empty — a plain outage that withheld every live event now recovers
+  any number of missed messages, not just one page. Termination is decided
+  solely by page fullness, never by the newest locally known message id, and a
+  superseded run still stops. Tests: a reconnect after 210 missed messages
+  with no subsequent live event recovers every one of them, in order, without
+  duplicates, including while search is open on screen.
+- **Preview verification** — see the "Preview verification" section above:
+  the deploy and its preview address come from the platform's post-push deploy
+  step, so the URL and in-product results land in the thread and here in the
+  next session on this post.
+
+## Session evidence, 2026-10-28 (round 3)
+
+- Full suite passes (`npm test`): 69 tests across API, store, payments, lock
+  and browser suites — 6 new since the last reviewed head, covering the three
+  payment-binding cases, the stale-head refusal, lock contention and
+  cross-namespace exclusion, and the 210-message recovery.
+- Persistence check passes: 29/29 (`npm run check`).

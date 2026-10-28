@@ -5,6 +5,9 @@ COPY server.js ./
 COPY lib ./lib
 COPY public ./public
 COPY scripts ./scripts
+# flock(1) is what lib/lock.js takes the data-directory lock through; the
+# deployment image must always have it, whatever busybox ships.
+RUN apk add --no-cache util-linux
 ENV NODE_ENV=production PORT=3000
 EXPOSE 3000
 # The volume mounts at /data (deploy.json): make sure the directory exists and

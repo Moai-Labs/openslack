@@ -25,18 +25,23 @@ direction requires. The product enforces these in code (`lib/limits.js`); tests 
   tier's 30 days).
 - **How a test payment is verified.** The owner opens a payment request in the
   product, which shows exactly what to send: **$12 in test-USDC, plus the
-  request's own unique fraction** — 12,000,001 to 12,000,099 raw units (6
-  decimals) — of Circle's USDC contract
+  request's own payment address** — exactly 12 test-USDC (12,000,000 raw
+  units, 6 decimals) of Circle's USDC contract
   `0x036CbD53842c5426634e7929541eC2318f3dCF7e` on **Base Sepolia** (chain id
-  84532), to the workspace's payment address. No two open requests ever share
-  an amount, so the transfer that satisfies one request can only ever be
-  claimed for it. The owner sends that transfer from any wallet and pastes the
-  transaction hash; the server then verifies the receipt read-only through a
-  public JSON-RPC node — the chain id, the asset contract (its code is checked
-  to exist on that chain), the recipient, the exact unique amount, that the
-  transaction settled (receipt status success, transfer log present and not
-  reorged away), and that the transfer was mined **after** the request was
-  created, so nobody's historical transfer can confirm anything. Only a
+  84532). Every request is bound to its **own non-reusable payment address**,
+  derived from the request's id alone (no key material is involved, so funds
+  sent there are by design unrecoverable — one more reason these transfers are
+  labelled tests worth nothing), so the transfer that satisfies one request can
+  never be claimed for any other request, at any time, in any state. The owner
+  sends that transfer from any wallet and pastes the transaction hash; the
+  server then verifies the receipt read-only through a public JSON-RPC node —
+  the chain id, the asset contract (its code is checked to exist on that
+  chain), the recipient, the exact amount, that the transaction settled
+  (receipt status success, transfer log present and not reorged away), and
+  that the transfer was mined in a block **strictly after the chain block the
+  node reported when the request was created** — a chain-derived creation
+  boundary, not a server-clock guess, so nobody's historical transfer can
+  confirm anything and no clock skew opens an allowance for old transfers. Only a
   verified, settled transfer grants anything; an unmined, reverted, foreign or
   too-old one leaves the workspace on the free tier with a clear error, and the
   request stays open for a retry.

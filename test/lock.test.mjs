@@ -1,9 +1,12 @@
-// Tests for the data-directory lock: ownership is an OS flock held by a
-// holder process. Proven here with real processes: exactly one of any number
-// of simultaneous acquirers wins, a lock left by a dead process is free
-// without any takeover step (the kernel released it at death), a live holder
-// is never judged from /proc — including from another PID namespace — and
-// ownership lasts until release or process death.
+// Tests for the data-directory lock: ownership is an OS flock held by the
+// writing process itself, on a descriptor it keeps open for its whole life.
+// Proven here with real processes: exactly one of any number of simultaneous
+// acquirers wins, a lock left behind by a dead process is free without any
+// takeover step (the kernel released it at death), killing some OTHER process
+// cannot free a live owner's directory, and — the property the holder-process
+// design could not give — during a long synchronous rewrite no replacement
+// writer can acquire ownership while the original writer can still mutate the
+// store.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -12,18 +15,23 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { acquire, LockError } from "../lib/lock.js";
 
+const LOCK_MODULE = JSON.stringify(new URL("../lib/lock.js", import.meta.url).pathname);
+const STORE_MODULE = JSON.stringify(new URL("../lib/store.js", import.meta.url).pathname);
+
 function freshDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "openslack-lock-"));
 }
 
 const lockPath = (dir) => path.join(dir, "lock.json");
+const logPath = (dir) => path.join(dir, "messages.jsonl");
+const progressPath = (dir) => path.join(dir, ".rewrite-progress");
 
 // A child process that tries once to acquire a directory, prints the
 // outcome, and then HOLDS the lock for a moment if it won — used to prove
-// the rules hold between real process instances. Holding matters: the
-// holder process keeps the flock until it is killed or its owner exits.
+// the rules hold between real process instances. Holding matters: the lock
+// lives on a descriptor the child keeps open until it exits.
 const CHILD = `
-const { acquire, LockError } = require(${JSON.stringify(new URL("../lib/lock.js", import.meta.url).pathname)});
+const { acquire, LockError } = require(${LOCK_MODULE});
 try {
   acquire(process.argv[2], "child");
   console.log("WON");
@@ -57,8 +65,8 @@ const exited = (child) =>
     child.on("exit", resolve);
   });
 
-// After a holder dies the kernel releases the flock within moments; poll
-// rather than assume, so the test measures the mechanism, not scheduler lag.
+// After an owner dies the kernel has already released the flock; poll rather
+// than assume, so the test measures the mechanism, not scheduler lag.
 function acquireEventually(dir, ms = 5000) {
   const deadline = Date.now() + ms;
   for (;;) {
@@ -78,12 +86,75 @@ const killHard = async (child) => {
   await exited(child);
 };
 
+// A child that acquires the lock and then performs a LONG SYNCHRONOUS
+// REWRITE of the store — the shape of scripts/restore.js and of the server's
+// own saves: nothing async, no chances for the event loop, each mutation
+// fsynced before the next. Its only side channel to the test is the progress
+// file; the store itself is mutated through the real Store API.
+const CHILD_WRITER = `
+const fs = require("node:fs");
+const { acquire, LockError } = require(${LOCK_MODULE});
+const { Store } = require(${STORE_MODULE});
+const dir = process.argv[2];
+const progress = process.argv[3];
+let store;
+try {
+  acquire(dir, "writer");
+  store = new Store(dir).init();
+} catch (err) {
+  console.log(err instanceof LockError ? "REFUSED" : "ERROR:" + err.message);
+  process.exit(0);
+}
+console.log("WON");
+const TOTAL = 600;
+fs.writeFileSync(progress, "START\\n");
+for (let i = 1; i <= TOTAL; i++) {
+  store.appendMessage({
+    id: String(i), wsId: "ws-rewrite", chId: "ch-rewrite", userId: "u-rewrite",
+    handle: "writer", text: "rewrite message " + i, at: new Date().toISOString()
+  });
+  fs.writeFileSync(progress, String(i) + "\\n");
+}
+fs.writeFileSync(progress, "DONE\\n");
+process.exit(0);
+`;
+
+// Launches the writing child. Returns { child, waitStart } — waitStart
+// resolves once the child owns the lock and the rewrite has begun.
+function runWriter(dir) {
+  const child = execFile(process.execPath, ["-e", CHILD_WRITER, "writer", dir, progressPath(dir)]);
+  const waitStart = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("writer never started the rewrite")), 15000);
+    const poll = () => {
+      let p = "";
+      try { p = fs.readFileSync(progressPath(dir), "utf8").trim(); } catch { /* not yet */ }
+      if (p === "START" || /^\d+$/.test(p)) { clearTimeout(timer); resolve(p); return; }
+      setTimeout(poll, 10);
+    };
+    child.stdout.on("data", (c) => { if (c.toString().includes("REFUSED")) { clearTimeout(timer); reject(new Error("writer was refused a free directory")); } });
+    poll();
+  });
+  return { child, waitStart };
+}
+
+// Reads the progress file, tolerating the races of watching a file the
+// writer rewrites every iteration.
+function readProgress(dir) {
+  try {
+    return fs.readFileSync(progressPath(dir), "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
 test("a lock file left behind by a dead process needs no takeover: the kernel already released it", () => {
   const dir = freshDir();
   // What a SIGKILLed server leaves: a file with a record, held by nobody.
   fs.writeFileSync(lockPath(dir), JSON.stringify({ pid: 4193, role: "server", at: "2020-01-01T00:00:00.000Z" }) + "\n");
   const lock = acquire(dir, "test");
   assert.equal(fs.existsSync(lockPath(dir)), true, "acquiring never deletes the lock file");
+  const record = JSON.parse(fs.readFileSync(lockPath(dir), "utf8"));
+  assert.equal(record.pid, process.pid, "the record now names the current owner");
   lock.release();
   assert.equal(fs.existsSync(lockPath(dir)), true, "releasing never deletes the lock file either");
 });
@@ -111,7 +182,7 @@ test("a live holder is respected, its death alone frees the directory", async ()
   assert.equal(fs.readFileSync(lockPath(dir), "utf8"), record, "the refused acquirer left the lock file untouched");
 
   // SIGKILL: no cleanup, no release call. The kernel ends the flock because
-  // the holder dies with its owner — that is the whole takeover mechanism.
+  // the owner dies with its descriptor — that is the whole release mechanism.
   await killHard(child);
   acquireEventually(dir).release();
 });
@@ -119,126 +190,95 @@ test("a live holder is respected, its death alone frees the directory", async ()
 test("ownership lasts until release, and release is safe to repeat", () => {
   const dir = freshDir();
   const lock = acquire(dir, "test");
-  assert.throws(() => acquire(dir, "test"), LockError, "a second acquirer in the same process is refused");
+  assert.throws(() => acquire(dir, "test"), LockError, "a second acquirer in the same process is refused: a new descriptor cannot share the lock");
   lock.release();
   acquireEventually(dir).release();
   acquireEventually(dir).release(); // must not throw
 });
 
-// A child that owns the lock AND writes to a file while it does — the real
-// shape of a server. On unexpected lock loss it must stop writing: first the
-// synchronous liveness check, then the loss callback, whichever lands first.
-const CHILD_WRITER = `
-const fs = require("node:fs");
-const { acquire } = require(${JSON.stringify(new URL("../lib/lock.js", import.meta.url).pathname)});
-let stopped = false;
-const lock = acquire(process.argv[2], "writer", {
-  onLost: () => {
-    if (!stopped) { stopped = true; console.log("LOST"); }
-  }
-});
-console.log("WON " + lock.holderPid);
-const timer = setInterval(() => {
-  if (stopped || !lock.alive()) {
-    if (!stopped) { stopped = true; console.log("LOST"); }
-    clearInterval(timer);
-    return;
-  }
-  fs.appendFileSync(process.argv[3], "w\\n");
-}, 20);
-setTimeout(() => process.exit(0), 30000); // stay alive for the test to watch
+// A child that owns the lock and spawns an unrelated child of its own — a
+// stand-in for any other process an operator might point a signal at.
+const CHILD_OWNER_WITH_DECOY = `
+const { spawn } = require("node:child_process");
+const { acquire, LockError } = require(${LOCK_MODULE});
+try {
+  acquire(process.argv[2], "owner");
+} catch (err) {
+  console.log(err instanceof LockError ? "REFUSED" : "ERROR:" + err.message);
+  process.exit(0);
+}
+const decoy = spawn("sleep", ["30"]);
+console.log("WON " + decoy.pid);
+setTimeout(() => { try { decoy.kill("SIGKILL"); } catch { /* done */ } process.exit(0); }, 15000);
 `;
 
-// Runs the writing child and lets the test wait for its next line.
-function runWriter(dir, file) {
-  const child = execFile(process.execPath, ["-e", CHILD_WRITER, "writer", dir, file]);
-  const lines = [];
-  const wait = (prefix, ms = 10000) =>
-    new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`timeout waiting for "${prefix}"; saw: ${lines.join(" | ") || "nothing"}`)), ms);
-      const check = () => {
-        const hit = lines.find((l) => l.startsWith(prefix));
-        if (hit) {
-          clearTimeout(timer);
-          resolve(hit);
-        }
-      };
-      child.stdout.on("data", (c) => {
-        for (const l of c.toString().split("\n")) if (l.trim()) lines.push(l.trim());
-        check();
-      });
-      check();
-    });
-  return { child, wait };
-}
-
-test("an intentional release is never reported as a loss", async () => {
+test("killing another process never frees the directory; killing the owner does", async () => {
   const dir = freshDir();
-  const losses = [];
-  const lock = acquire(dir, "owner", { onLost: (why) => losses.push(why) });
-  lock.release(); // the owner chose to let go
-  acquireEventually(dir).release(); // the directory is free for the next owner
-  // Give the wrapper's exit event its moment: it must not surface as a loss.
-  await new Promise((r) => setTimeout(r, 200));
-  assert.deepEqual(losses, [], "release() is an intentional release, not an unexpected loss");
-  assert.equal(lock.lost, false);
+  const { child, outcome } = await runChild(process.execPath, ["-e", CHILD_OWNER_WITH_DECOY, "owner", dir]);
+  assert.match(outcome, /^WON \d+$/, "the owner took the free lock and reported its decoy");
+  const decoyPid = Number(outcome.split(" ")[1]);
+  assert.ok(decoyPid > 0);
+
+  // Kill the decoy — some other process entirely. The directory must stay
+  // owned: no process but the owner holds anything, so nothing can be freed.
+  process.kill(decoyPid, "SIGKILL");
+  await new Promise((r) => setTimeout(r, 300));
+  assert.throws(() => acquire(dir, "test"), LockError, "the owner still owns the directory after its decoy died");
+
+  // Only the owner's own death frees the directory.
+  await killHard(child);
+  acquireEventually(dir).release();
 });
 
-test("killing the holder while its owner stays alive fails the owner closed before another owner acquires", async () => {
+test("no replacement writer can acquire ownership during a long synchronous rewrite, and the writer can still mutate the store throughout", async () => {
   const dir = freshDir();
-  const losses = [];
-  const lock = acquire(dir, "owner", { onLost: (why) => losses.push(why) });
-  assert.equal(lock.alive(), true, "the holder is alive while the lock is held");
-  assert.ok(lock.holderPid > 0, "the owner knows the holder it depends on");
+  const { child, waitStart } = runWriter(dir);
+  await waitStart; // the writer owns the directory and is rewriting
 
-  // Kill the HOLDER alone; the owner process keeps running.
-  process.kill(lock.holderPid, "SIGKILL");
-  const deadline = Date.now() + 5000;
-  while (!lock.lost && Date.now() < deadline) await new Promise((r) => setImmediate(r));
-  assert.equal(lock.lost, true, "the owner learned of the unexpected loss");
-  assert.match(lock.lossReason, /lost unexpectedly/);
-  assert.equal(losses.length, 1, "the loss was reported exactly once");
-  assert.equal(lock.alive(), false, "the synchronous check refuses to vouch for a dead holder");
+  // Compete for the whole window: every attempt while the rewrite runs must
+  // be refused, and the writer's mutations must keep landing meanwhile.
+  const seenLines = new Set();
+  let attempts = 0;
+  for (;;) {
+    const p = readProgress(dir);
+    if (p === "DONE") break;
+    attempts++;
+    try {
+      acquire(dir, "racer").release();
+      assert.fail("a replacement writer acquired ownership during the original writer's rewrite");
+    } catch (err) {
+      if (!(err instanceof LockError)) throw err;
+    }
+    for (const line of fs.readFileSync(logPath(dir), "utf8").split("\n")) {
+      if (line.trim()) seenLines.add(JSON.parse(line).id);
+    }
+  }
+  assert.ok(attempts > 5, `the competitor actually raced the rewrite (attempted ${attempts} times)`);
+  assert.equal(seenLines.size, 600, "every one of the writer's 600 fsynced mutations landed while it owned the directory");
 
-  // Only after the first owner has failed closed does a second owner take
-  // the directory — the first owner's handle reports lost, its callback has
-  // run, and nothing of it is mid-write.
-  const second = acquireEventually(dir);
-  lock.release(); // must not surface as a second loss
-  await new Promise((r) => setTimeout(r, 100));
-  assert.equal(losses.length, 1, "an intentional release after a loss is not another loss");
-  second.release();
+  await exited(child);
+  assert.equal(child.exitCode, 0);
+  // When the writer finishes, ownership is available — not stuck behind any
+  // takeover logic.
+  acquireEventually(dir).release();
 });
 
-test("a writing owner stops writing when its holder dies, and writes nothing under the new owner", async () => {
+test("a writer SIGKILLed mid-rewrite frees the directory at once", async () => {
   const dir = freshDir();
-  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-writes-"));
-  const file = path.join(scratch, "writes.log");
-  const writer = runWriter(dir, file);
-  const won = await writer.wait("WON");
-  const holderPid = Number(won.split(" ")[1]);
-  assert.ok(holderPid > 0);
-
-  // The owner is writing while it owns the lock.
-  const writesStart = Date.now();
-  while ((!fs.existsSync(file) || fs.readFileSync(file, "utf8").length === 0) && Date.now() - writesStart < 5000) {
+  const { child, waitStart } = runWriter(dir);
+  await waitStart;
+  // Let the rewrite get well under way, then kill it with no chance to clean up.
+  while (Number(readProgress(dir) || 0) < 100) {
     await new Promise((r) => setImmediate(r));
   }
-  assert.ok(fs.existsSync(file) && fs.readFileSync(file, "utf8").length > 0, "the owner was writing while it owned the lock");
+  child.kill("SIGKILL");
+  await exited(child);
+  assert.ok(fs.existsSync(logPath(dir)), "the killed writer had already mutated the store");
 
-  // Kill the holder; the owner must stop — synchronously, before the next
-  // write — and report the loss.
-  process.kill(holderPid, "SIGKILL");
-  await writer.wait("LOST");
-  const stoppedAt = fs.readFileSync(file, "utf8");
-
-  // Now a second owner takes the directory. The first owner, failed closed,
-  // must not write a byte under it.
-  const second = acquireEventually(dir);
-  await new Promise((r) => setTimeout(r, 300));
-  assert.equal(fs.readFileSync(file, "utf8"), stoppedAt, "no write after the loss — the directory belongs to the new owner alone");
-  second.release();
-  writer.child.kill("SIGKILL");
+  // The kernel released the flock with the process: no stale-lock takeover,
+  // no liveness re-judging — the next owner simply succeeds, immediately.
+  const next = acquireEventually(dir, 2000);
+  next.release();
 });
 
 test("two live processes in separate PID namespaces sharing one data directory: exactly one writer", async (t) => {
@@ -268,6 +308,6 @@ test("two live processes in separate PID namespaces sharing one data directory: 
 
   await killHard(a.child);
   const c = await ns(dir);
-  assert.equal(c.outcome, "WON", "once the holder is gone, another namespace's process acquires the lock");
+  assert.equal(c.outcome, "WON", "once the owner is gone, another namespace's process acquires the lock");
   c.child.kill("SIGKILL");
 });

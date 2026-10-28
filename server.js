@@ -71,23 +71,14 @@ const { dir: dataDir, durable } = resolveDataDir();
 // One owner per data directory: a restore run against a live server would be
 // overwritten by the server's stale in-memory state on its next save.
 //
-// The lock can also be LOST while we run: if the holder process dies without
-// a release() — an OOM kill, an operator's stray signal — the kernel frees
-// the directory at that moment and another process may take it while our
-// in-memory state is still live. From that point every write we make risks
-// clobbering the new owner's data, so we fail closed: refuse requests, drop
-// the live streams and exit, and let the deployment restart us (a restart
-// takes the lock again before serving anything). release() during our own
-// SIGTERM shutdown is an intentional release and reports nothing.
+// This process holds the OS flock itself, for its entire life, so there is no
+// loss to watch for while we run: the kernel frees the directory only when we
+// die or release() it, and killing any other process cannot free it. A
+// restart takes the lock again before serving anything. release() during our
+// own SIGTERM shutdown is an intentional release.
 let dirLock;
 try {
-  dirLock = acquire(dataDir, "server", {
-    onLost: () => {
-      console.error("FATAL: the data-directory lock was lost unexpectedly; stopping all writes and exiting so the new owner's data cannot be clobbered. The deployment will restart this server.");
-      api.closeAll();
-      process.exit(1);
-    }
-  });
+  dirLock = acquire(dataDir, "server");
 } catch (err) {
   console.error(`refusing to start: ${err.message}`);
   process.exit(1);
@@ -106,10 +97,10 @@ const staticFiles = new Map(
 );
 
 const server = http.createServer(async (req, res) => {
-  // A lost lock is worse than a slow server: refuse everything rather than
-  // serve (and write) beside a new owner of the directory. alive() also
-  // catches a holder death in the moments before its exit event lands.
-  if (dirLock.lost || !dirLock.alive()) {
+  // After release() — our own SIGTERM teardown — refuse everything rather
+  // than serve (and write) while the directory is up for grabs. While the
+  // process lives and has not released, it owns the directory outright.
+  if (!dirLock.alive()) {
     return sendJson(res, 503, { error: "The server has lost exclusive ownership of its data directory and is shutting down." });
   }
   res.setHeader("x-content-type-options", "nosniff");

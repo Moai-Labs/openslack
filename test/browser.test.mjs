@@ -17,7 +17,9 @@ import { JSDOM, VirtualConsole } from "jsdom";
 // payment flow (request, verify, entitlement) against these receipts.
 let chainId = "0x14a34"; // 84532 = Base Sepolia
 let assetCode = "0x6080"; // non-empty: the asset contract exists
+let headNumber = "0x30a3796"; // the chain head the node reports to payment start; receipts sit in a later block
 let receipts = new Map(); // txHash (lowercase) -> receipt object
+let blocks = new Map(); // blockNumber (lowercase) -> { timestamp } in seconds; unset blocks are "now"
 const fakeRpc = http.createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
@@ -26,7 +28,13 @@ const fakeRpc = http.createServer((req, res) => {
     let result = null;
     if (method === "eth_chainId") result = chainId;
     else if (method === "eth_getCode") result = assetCode;
+    else if (method === "eth_blockNumber") result = headNumber;
     else if (method === "eth_getTransactionReceipt") result = receipts.get(String(params[0]).toLowerCase()) ?? null;
+    else if (method === "eth_getBlockByNumber") {
+      const key = String(params[0]).toLowerCase();
+      const ts = blocks.has(key) ? blocks.get(key).timestamp : Math.floor(Date.now() / 1000);
+      result = { number: params[0], timestamp: "0x" + BigInt(ts).toString(16) };
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result }));
   });
@@ -289,7 +297,9 @@ test("owner tools appear for the owner and work; non-owners never see them", asy
 // ---- the labelled test-USDC payment, driven through the real product ----
 
 const TX = (n) => "0x" + String(n).padStart(2, "0") + "0".repeat(62); // unique per number
-const receiptFor = (txHash) => {
+// The receipt carries the exact amount an open payment request asked for —
+// that request's own unique amount is what the server verifies against.
+const receiptFor = (txHash, amountRaw = BigInt(LIMITS.PAID_PRICE_USDC) * 10n ** 6n, to) => {
   const pad = (a) => "0x" + "0".repeat(24) + a.toLowerCase().slice(2);
   return {
     blockHash: "0x" + "ab".repeat(32),
@@ -298,8 +308,8 @@ const receiptFor = (txHash) => {
     logs: [
       {
         address: LIMITS.PAY_USDC_ADDRESS,
-        topics: [TRANSFER_TOPIC, pad("0x1111000000000000000000000000000000000001"), pad(LIMITS.PAY_RECIPIENT)],
-        data: "0x" + (BigInt(LIMITS.PAID_PRICE_USDC) * 10n ** 6n).toString(16).padStart(64, "0"),
+        topics: [TRANSFER_TOPIC, pad("0x1111000000000000000000000000000000000001"), pad(to)],
+        data: "0x" + BigInt(amountRaw).toString(16).padStart(64, "0"),
         blockNumber: "0x30a3797",
         logIndex: "0x0",
         removed: false,
@@ -327,33 +337,32 @@ test("an owner sees the test-payment control, completes the verified flow, and s
   await until(() => doc.querySelector("#pay-test-btn").hidden === false, "pay control revealed for the owner");
   assert.equal(doc.querySelector("#tier-info").textContent.includes("Free tier"), true, "starts on the free tier");
 
-  // step 1: the product shows the exact payment request, labelled as a test
+  // step 1: the product shows the exact payment request, labelled as a test —
+  // the request the panel itself opened, whose id and address it carries
   doc.querySelector("#pay-test-btn").onclick();
   await until(() => doc.querySelector("#pay-panel").hidden === false, "payment panel opened");
   const details = doc.querySelector("#pay-details").textContent;
   assert.match(details, /TEST payment/);
-  assert.match(details, new RegExp(LIMITS.PAY_RECIPIENT));
+  const shownRecipient = details.match(/payment address (0x[0-9a-f]{40})/i)[1]; // the request's own payment address
+  assert.ok(shownRecipient, "the panel shows the request's own payment address");
+  const shownIntentId = doc.querySelector("#pay-tx").dataset.intentId;
+  assert.ok(shownIntentId, "the panel holds the request it opened");
   assert.match(details, new RegExp(LIMITS.PAY_USDC_ADDRESS, "i"));
-  assert.match(details, /12000000/);
+  assert.match(details, /exactly 12 test-USDC/, "the exact price is shown");
   assert.match(details, /Base Sepolia/);
   assert.match(details, /zero revenue/);
 
   // step 2 with a hash the test chain has never seen: the product refuses and
   // explains, and nothing is granted
   receipts.delete(TX(70));
-  doc.querySelector("#pay-tx").dataset.intentId = (
-    await (async () => {
-      const r = await call("POST", `/api/ws/${paySlug}/pay-test/start`, null, payOwnerCookie);
-      return r.body.intentId;
-    })()
-  );
   doc.querySelector("#pay-tx").value = TX(70);
   doc.querySelector("#form-pay").dispatchEvent(new page.window.Event("submit", { bubbles: true, cancelable: true }));
   await until(() => doc.querySelector("#pay-error").textContent.includes("not settled"), "unsettled hash explained in the product");
   assert.equal(doc.querySelector("#tier-info").textContent.includes("Free tier"), true, "still free after a failed verification");
 
-  // the real, settled transfer verifies and the entitlement appears
-  receipts.set(TX(70), receiptFor(TX(70)));
+  // the real, settled transfer to the request's own address verifies and the
+  // entitlement appears
+  receipts.set(TX(70), receiptFor(TX(70), BigInt(LIMITS.PAID_PRICE_USDC) * 10n ** 6n, shownRecipient));
   doc.querySelector("#form-pay").dispatchEvent(new page.window.Event("submit", { bubbles: true, cancelable: true }));
   await until(() => doc.querySelector("#tier-info").textContent.includes("Paid tier (test payment)"), "paid tier shown");
   assert.match(doc.querySelector("#tier-info").textContent, /365-day history/);
@@ -470,8 +479,8 @@ test("seed: a paid workspace with enough posters to outrun the rate limit", asyn
   recOwnerCookie = cookieOf((await call("POST", "/api/signup", { handle: "recowner", password: "longenough1" })).res);
   const ws = await call("POST", "/api/workspaces", { name: "Recovery Test" }, recOwnerCookie);
   recSlug = ws.body.slug;
-  receipts.set(TX(90), receiptFor(TX(90)));
   const start = await call("POST", `/api/ws/${recSlug}/pay-test/start`, null, recOwnerCookie);
+  receipts.set(TX(90), receiptFor(TX(90), BigInt(LIMITS.PAID_PRICE_USDC) * 10n ** 6n, start.body.recipient));
   const confirm = await call("POST", `/api/ws/${recSlug}/pay-test/confirm`, { intentId: start.body.intentId, txHash: TX(90) }, recOwnerCookie);
   assert.equal(confirm.res.status, 200, "the workspace is on the paid tier so 25 members can join");
   const inv = await call("POST", "/api/invites", { slug: recSlug }, recOwnerCookie);

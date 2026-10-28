@@ -86,15 +86,61 @@ repaired by truncation before new appends.
   channel context, back to channel) and history after reload and channel switch.
 - Preview verification: recorded below once the dev deploy is verified.
 
+## Review round 4, answered 2026-10-28
+
+All three required changes, made on post-17:
+
+- **Payment-request creation can no longer race deletion or the open-request
+  limit (lib/store.js).** The ownership and pending-request-limit checks before
+  the `chainHead` call stay only as a fast path. Immediately after the node
+  answers, in one synchronous section with no await before the insert and save,
+  the code re-fetches the live workspace by id, revalidates the owner's
+  membership on it, and recounts the unexpired pending intents that actually
+  exist — so a workspace deleted during the RPC call leaves no intent naming it
+  or its owner's handle (410), and concurrent starts each recount what is
+  really there, so no more than five requests can ever open (429). Tests:
+  deletion mid-RPC (no intent in memory or on disk after reload, the deleted
+  payer's handle stored nowhere) and 7 concurrent starts at the limit (exactly
+  5 open, 2 refused with 429, every survivor its own payment address).
+- **attachMember checks everything before touching anything (lib/store.js).**
+  The capacity check (and the already-a-member bypass) happens before the
+  pending record is removed or any workspace state is mutated; a refused
+  attach leaves `pendingMembers` exactly as it was, so a later save can never
+  persist the loss of a pending identity. Test: attach to a full workspace
+  fails, a subsequent save and reload still finds the pending record, and it
+  survives export too.
+- **Preview verification** — see below; the corrected revision is pushed at the
+  end of this session and the platform's deploy step brings it to the preview.
+
+## Session evidence, 2026-10-28 (round 4)
+
+- Full suite passes (`npm test`): 86 tests across API, store, payments, lock,
+  pilot and browser suites — including the two new creation-race tests.
+- Persistence check passes: 29/29 (`npm run check`).
+- The real payment chain was reachable and verified live this session
+  (`eth_chainId` on https://sepolia.base.org → `0x14a34`, Base Sepolia). An
+  actual signed test-USDC transfer was not: every dispensing path for
+  canonical test-USDC needs an account or an API key (Circle's faucet wants a
+  Circle login, Coinbase's faucet wants CDP credentials, and the no-login
+  faucets found are either gone or hand out a mock token at a different
+  contract, which the verifier rightly refuses). A tool request for a funded
+  testnet wallet or faucet access is filed with the platform.
+
 ## Preview verification
 
-- **Status, 2026-10-28:** not yet verified in a live preview. The preview address
-  is produced by the platform's deploy step, which runs after a session's queued
-  push — no session can fetch its own deploy's URL while running. This revision
-  is pushed at the end of this session; the next session on this post will verify
-  the test-USDC flow in-product against that preview (open the panel, complete a
-  transfer to the request's own address, confirm the 30-day entitlement renders)
-  and post the URL and results in the proposal thread and here.
+- **Preview address:** https://fl-dev-a08b773d-0291-4db7-b6c9-9c2a93c26218.fly.dev
+  (the startup's standing dev preview; it serves whatever the platform last
+  merged and deployed).
+- **Status, 2026-10-28:** the preview is not answering right now — it went down
+  on the previous deploy (a fresh storage volume mounting root-owned while the
+  container runs unprivileged; the image fix is already on main and rides
+  along with this session's push, which also brings the corrected revision to
+  the preview). The deploy step runs after this session ends, so the
+  in-product check of the corrected revision — open the payment panel, verify
+  the settled transfer, see the 30-day entitlement render — lands in the next
+  session on this post, with the results posted here and in the proposal
+  thread. The deploy-timing constraint is real but is not a substitute for the
+  check itself; it is recorded here as a dated follow-up, not as done.
 
 ## Session note, 2026-10-27 (evening)
 

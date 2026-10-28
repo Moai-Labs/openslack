@@ -294,8 +294,8 @@ test("a workspace deleted while verification is in flight grants nothing and lea
   const s = freshStore();
   const a = s.createUser("vanisher", "longenough1");
   const ws = s.createWorkspace(a, "Vanishing");
-  receipts.set(TX(80), transferReceipt({ txHash: TX(80), to: RECIPIENT }));
-  const intent = s.startTestPayment(ws, a);
+  const intent = await s.startTestPayment(ws, a);
+  receipts.set(TX(80), transferReceipt({ txHash: TX(80), to: intent.recipient }));
 
   let release;
   holdReceipt = new Promise((r) => (release = r));
@@ -304,7 +304,10 @@ test("a workspace deleted while verification is in flight grants nothing and lea
   s.deleteWorkspace(ws); // the world moves on while the node is asked
   release();
   holdReceipt = null;
-  await assert.rejects(settling, (e) => e.status === 404 && /no longer exists/.test(e.message));
+  await assert.rejects(
+    settling,
+    (e) => e.status === 410 && /deleted while the payment was being verified/.test(e.message)
+  );
 
   assert.equal(s.workspaceBySlug(ws.slug), null, "the workspace was not resurrected");
   assert.equal((s.db.payments || []).length, 0, "no payment record for a deleted workspace");
@@ -316,9 +319,9 @@ test("confirmations racing on one intent settle it exactly once", async () => {
   const s = freshStore();
   const a = s.createUser("racer", "longenough1");
   const ws = s.createWorkspace(a, "Once Only");
-  receipts.set(TX(81), transferReceipt({ txHash: TX(81), to: RECIPIENT }));
-  receipts.set(TX(82), transferReceipt({ txHash: TX(82), to: RECIPIENT }));
-  const intent = s.startTestPayment(ws, a);
+  const intent = await s.startTestPayment(ws, a);
+  receipts.set(TX(81), transferReceipt({ txHash: TX(81), to: intent.recipient }));
+  receipts.set(TX(82), transferReceipt({ txHash: TX(82), to: intent.recipient }));
 
   let release;
   holdReceipt = new Promise((r) => (release = r));
@@ -351,6 +354,53 @@ test("a workspace cannot drown in open payment requests", async () => {
   for (let i = 0; i < LIMITS.MAX_PENDING_PAYMENT_INTENTS; i++) intents.push(await s.startTestPayment(ws, a));
   await assert.rejects(() => s.startTestPayment(ws, a), (e) => e.status === 429 && /open payment requests/.test(e.message));
   assert.equal(new Set(intents.map((i) => i.recipient)).size, intents.length, "every open request carries its own payment address");
+});
+
+test("a workspace deleted while a payment request is being opened leaves no intent behind", async () => {
+  const s = freshStore();
+  const a = s.createUser("goneowner", "longenough1");
+  const ws = s.createWorkspace(a, "Deleted Midstart");
+  rpcDelayMs = 100; // holds every node answer, so the start is in flight when the deletion lands
+  try {
+    const starting = s.startTestPayment(ws, a); // the chain head is being asked
+    await new Promise((r) => setTimeout(r, 50)); // the request is now awaiting the node
+    s.deleteWorkspace(ws); // the world moves on while the node is asked
+    await assert.rejects(starting, (e) => e.status === 410 && /deleted/.test(e.message));
+  } finally {
+    rpcDelayMs = 0;
+  }
+  assert.equal((s.db.paymentIntents || []).length, 0, "no intent names the deleted workspace");
+  assert.equal(
+    JSON.stringify(s.db.paymentIntents || []).includes("goneowner"),
+    false,
+    "the deleted payer's handle is stored nowhere"
+  );
+  const s2 = new Store(s.dir).init(); // and nothing was persisted either
+  assert.equal((s2.db.paymentIntents || []).length, 0, "a reloaded store holds no intent for the deleted workspace");
+});
+
+test("concurrent starts at the open-request limit cannot exceed it", async () => {
+  const s = freshStore();
+  const a = s.createUser("crowder", "longenough1");
+  const ws = s.createWorkspace(a, "Crowded Starts");
+  rpcDelayMs = 120; // every start is in flight before the first one commits
+  const attempts = [];
+  try {
+    for (let i = 0; i < LIMITS.MAX_PENDING_PAYMENT_INTENTS + 2; i++) {
+      attempts.push(s.startTestPayment(ws, a).then(() => "opened", (e) => e));
+    }
+    const outcomes = await Promise.all(attempts);
+    const opened = outcomes.filter((r) => r === "opened");
+    const refused = outcomes.filter((r) => r !== "opened");
+    assert.equal(opened.length, LIMITS.MAX_PENDING_PAYMENT_INTENTS, "only the limit's worth of requests opened");
+    assert.equal(refused.length, 2, "the rest were refused, not crashed");
+    for (const e of refused) assert.equal(e.status, 429, "each refusal is the open-request limit");
+  } finally {
+    rpcDelayMs = 0;
+  }
+  const pending = s.db.paymentIntents.filter((i) => i.wsId === ws.id && i.status === "pending");
+  assert.equal(pending.length, LIMITS.MAX_PENDING_PAYMENT_INTENTS, "no more than the limit is pending afterwards");
+  assert.equal(new Set(pending.map((i) => i.recipient)).size, pending.length, "every survivor still carries its own address");
 });
 
 test("the paid tier holds 25 members, the free tier 5", async () => {

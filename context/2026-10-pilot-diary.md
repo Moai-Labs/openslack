@@ -245,3 +245,13 @@ Prompts sent: none. Exports used: none (all data above is synthetic and dated).
    parallel if the team clears trust early.
 4. The paying-organiser item: real payment needs a supported checkout with verified
    settlement (access requested); test transfers never qualify.
+
+Test-infrastructure note (same session): the full suite ran 74/75 twice, both times
+on the join-page browser test "an ordinary invitation URL displays the correct
+workspace under the deployed CSP". Reproduced with instrumentation: the test's
+fetch double reuses a pooled socket that the server had already closed under its
+default 5 s keep-alive timeout (this box is slow enough — scrypt seed steps — that
+>5 s gaps are routine), and undici surfaces that as ECONNRESET where a real browser
+silently retries a safe GET on a stale socket. The product was never wrong; the
+test double now does what a browser does (one silent retry for a GET that resets
+before any bytes). Product code untouched.

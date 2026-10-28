@@ -138,3 +138,36 @@ Review round 3 of 5 on post-18 at 402be1b asked for two changes; both are made
   pending-body pattern). Tests park a real request with headers only, delete
   the workspace mid-body, finish the body, and assert a 404 with no orphan
   message in messages.jsonl and no ghost channel in db.json.
+
+## 2026-10-28 (session 6)
+
+Two threads this session: the merged branch's deploy never came up, and
+review round 5's one open point.
+
+- Deploy: the platform merged post-18 into main as 53a6a52 and deployed it to
+  the fly dev app, but after 10 minutes "not every machine had started and
+  answered" and the post was not marked delivered. This session the endpoint
+  still hangs (TLS connects, no HTTP response after 30s), and there is no
+  tool from this lane to read the machine's logs (probed agent/deploy,
+  /deployments, /status, /services, /logs — all 404). Leading hypothesis,
+  reproduced locally: a freshly created volume's root directory is owned by
+  root:root, and the image ran `USER node`, so the server's DATA_DIR write
+  probe got EACCES and it exited 1 in a crash loop — exactly "machine starts
+  but never answers". Reproduced: `NODE_ENV=production DATA_DIR=/var/log node
+  server.js` → "refusing to start: ... EACCES" → exit 1. The Dockerfile now
+  chowns /data at entrypoint (as root) and drops to node via su-exec, so a
+  root-owned fresh volume works. Fly-side volume behaviour itself is
+  unverified from here; if the redeploy at the new head still does not come
+  up, the platform needs to look at the machine logs.
+- Review round 5's open point (the last round merged anyway, but the reviewer
+  wrote "must be fixed before inviting a real community"): lib/store.js
+  appendMessage() left a partially written record on disk after a failed
+  append and permitted subsequent writes, so the next acknowledged message
+  would glue onto the torn bytes and loadMessages() would refuse to start on
+  restart, making acknowledged history unavailable. Fixed: the append records
+  the log's length first; on any failure it rolls the file back to that
+  boundary (truncate + fsync, unlink for a just-created log) and rethrows; if
+  the rollback itself fails the store sets logBroken and refuses every
+  further append with a 503 until restart. Tests: partial-write rollback
+  leaves a loadable log; a failed rollback locks further appends out without
+  extending the log past the torn bytes.

@@ -16,6 +16,8 @@ import http from "node:http";
 let chainId = "0x14a34"; // 84532 = Base Sepolia
 let assetCode = "0x6080"; // non-empty: the asset contract exists
 let receipts = new Map(); // txHash (lowercase) -> receipt object (or null: not yet mined)
+let blocks = new Map(); // blockNumber (lowercase) -> { timestamp } in seconds; unset blocks are "now"
+let rpcDelayMs = 0; // holds every verification call in flight, for concurrency tests
 const fakeRpc = http.createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
@@ -25,8 +27,17 @@ const fakeRpc = http.createServer((req, res) => {
     if (method === "eth_chainId") result = chainId;
     else if (method === "eth_getCode") result = assetCode;
     else if (method === "eth_getTransactionReceipt") result = receipts.get(String(params[0]).toLowerCase()) ?? null;
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result }));
+    else if (method === "eth_getBlockByNumber") {
+      const key = String(params[0]).toLowerCase();
+      const ts = blocks.has(key) ? blocks.get(key).timestamp : Math.floor(Date.now() / 1000);
+      result = { number: params[0], timestamp: "0x" + BigInt(ts).toString(16) };
+    }
+    const respond = () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result }));
+    };
+    if (rpcDelayMs) setTimeout(respond, rpcDelayMs);
+    else respond();
   });
 });
 await new Promise((resolve) => fakeRpc.listen(0, "127.0.0.1", resolve));
@@ -45,19 +56,22 @@ function freshStore() {
 
 // A receipt for one ERC-20 Transfer log, shaped the way the live chain's
 // receipts look (verified against Base Sepolia; see context evidence file).
-function transferReceipt({ txHash, from, to, value = LIMITS.PAID_PRICE_USDC, asset = LIMITS.PAY_USDC_ADDRESS, status = "0x1", topic0 = TRANSFER_TOPIC, amountRaw = null, logIndex = "0x0", removed = false }) {
-  const raw = amountRaw ?? (BigInt(value) * 10n ** 6n); // 6 decimals on this asset
+// `amountRaw` is the exact raw amount the receipt's transfer carries — a test
+// passes the intent's own unique amount here, because that is what the server
+// verifies against.
+function transferReceipt({ txHash, from, to, asset = LIMITS.PAY_USDC_ADDRESS, status = "0x1", topic0 = TRANSFER_TOPIC, amountRaw, logIndex = "0x0", blockNumber = "0x30a3797", removed = false }) {
+  const raw = amountRaw ?? BigInt(LIMITS.PAID_PRICE_USDC) * 10n ** 6n; // 6 decimals on this asset
   const pad = (a) => "0x" + "0".repeat(24) + a.toLowerCase().slice(2);
   return {
     blockHash: "0x" + "ab".repeat(32),
-    blockNumber: "0x30a3797",
+    blockNumber,
     status,
     logs: [
       {
         address: asset,
         topics: [topic0, pad(from || "0x1111000000000000000000000000000000000001"), pad(to || LIMITS.PAY_RECIPIENT)],
         data: "0x" + raw.toString(16).padStart(64, "0"),
-        blockNumber: "0x30a3797",
+        blockNumber,
         logIndex,
         removed,
         transactionHash: txHash
@@ -95,7 +109,8 @@ test("start opens an owner-only payment request bound to the workspace", async (
   assert.equal(intent.asset, ASSET);
   assert.equal(intent.recipient, RECIPIENT);
   assert.equal(intent.amountUsdc, 12);
-  assert.equal(intent.amountRaw, "12000000"); // 6 decimals
+  assert.match(intent.amountRaw, /^120000[0-9]{2}$/, "the price plus the request's own unique fraction, at 6 decimals");
+  assert.ok(intent.cents >= 1 && intent.cents <= 99, "the binding fraction is a small distinct value");
   assert.ok(Date.parse(intent.expiresAt) > Date.now());
   // the request is persisted, so a restart cannot lose an owner's in-flight payment
   const s2 = new Store(s.dir).init();
@@ -109,7 +124,7 @@ test("a verified settled transfer grants the entitlement and counts as zero reve
   assert.equal(ws.paidUntil, null);
 
   const intent = s.startTestPayment(ws, a);
-  receipts.set(TX(1), transferReceipt({ txHash: TX(1), to: RECIPIENT }));
+  receipts.set(TX(1), transferReceipt({ txHash: TX(1), to: RECIPIENT, amountRaw: BigInt(intent.amountRaw) }));
   const result = await s.completeTestPayment(ws, a, intent.id, TX(1));
   assert.equal(result.kind, "test");
   assert.equal(result.tier, "paid");
@@ -135,6 +150,10 @@ test("a verified settled transfer grants the entitlement and counts as zero reve
 test("an unsettled, reverted or wrong transfer never grants anything", async () => {
   const s = freshStore();
   const { user: a, ws } = paidOwner(s, "rejects");
+  // One open request is enough: a failed verification leaves it payable, so
+  // the owner can retry with a correct transaction hash on the same request.
+  const intent = s.startTestPayment(ws, a);
+  const AMT = BigInt(intent.amountRaw); // the request's own binding amount
 
   const cases = [
     {
@@ -146,35 +165,35 @@ test("an unsettled, reverted or wrong transfer never grants anything", async () 
     },
     {
       what: "reverted transaction",
-      receipt: transferReceipt({ txHash: TX(11), status: "0x0" }),
+      receipt: transferReceipt({ txHash: TX(11), status: "0x0", amountRaw: AMT }),
       tx: TX(11),
       want: 422,
       note: /reverted/
     },
     {
       what: "wrong recipient",
-      receipt: transferReceipt({ txHash: TX(12), to: "0x9999000000000000000000000000000000000999" }),
+      receipt: transferReceipt({ txHash: TX(12), to: "0x9999000000000000000000000000000000000999", amountRaw: AMT }),
       tx: TX(12),
       want: 422,
       note: /does not carry/
     },
     {
-      what: "wrong amount (11.999999 USDC)",
-      receipt: transferReceipt({ txHash: TX(13), amountRaw: 11999999n }),
+      what: "wrong amount (one raw unit short of the request)",
+      receipt: transferReceipt({ txHash: TX(13), amountRaw: AMT - 1n }),
       tx: TX(13),
       want: 422,
       note: /does not carry/
     },
     {
       what: "wrong asset contract",
-      receipt: transferReceipt({ txHash: TX(14), asset: "0x2222000000000000000000000000000000000022" }),
+      receipt: transferReceipt({ txHash: TX(14), asset: "0x2222000000000000000000000000000000000022", amountRaw: AMT }),
       tx: TX(14),
       want: 422,
       note: /does not carry/
     },
     {
       what: "not a Transfer event",
-      receipt: transferReceipt({ txHash: TX(15), topic0: "0x" + "7".repeat(64) }),
+      receipt: transferReceipt({ txHash: TX(15), topic0: "0x" + "7".repeat(64), amountRaw: AMT }),
       tx: TX(15),
       want: 422,
       note: /does not carry/
@@ -188,7 +207,7 @@ test("an unsettled, reverted or wrong transfer never grants anything", async () 
     },
     {
       what: "a log the chain has dropped (reorged away)",
-      receipt: transferReceipt({ txHash: TX(16), removed: true }),
+      receipt: transferReceipt({ txHash: TX(16), amountRaw: AMT, removed: true }),
       tx: TX(16),
       want: 422,
       note: /does not carry/
@@ -199,9 +218,6 @@ test("an unsettled, reverted or wrong transfer never grants anything", async () 
     if (c.receipt) receipts.set(c.tx.toLowerCase(), c.receipt);
     else receipts.delete(c.tx.toLowerCase());
   }
-  // One open request is enough: a failed verification leaves it payable, so
-  // the owner can retry with a correct transaction hash on the same request.
-  const intent = s.startTestPayment(ws, a);
   for (const c of cases) {
     await assert.rejects(
       () => s.completeTestPayment(ws, a, intent.id, c.tx),
@@ -217,9 +233,9 @@ test("an unsettled, reverted or wrong transfer never grants anything", async () 
 test("a settled transfer cannot fund a second entitlement (replay)", async () => {
   const s = freshStore();
   const { user: a, ws } = paidOwner(s, "replay");
-  receipts.set(TX(20), transferReceipt({ txHash: TX(20), to: RECIPIENT }));
 
   const intent1 = s.startTestPayment(ws, a);
+  receipts.set(TX(20), transferReceipt({ txHash: TX(20), to: RECIPIENT, amountRaw: BigInt(intent1.amountRaw) }));
   await s.completeTestPayment(ws, a, intent1.id, TX(20));
   assert.equal(s.tier(ws), "paid");
   const first = Date.parse(ws.paidUntil);
@@ -236,8 +252,8 @@ test("a settled transfer cannot fund a second entitlement (replay)", async () =>
   assert.equal(s.tier(ws2), "free");
 
   // paying again with a different settled transfer stacks 30 more days
-  receipts.set(TX(21), transferReceipt({ txHash: TX(21), to: RECIPIENT }));
   const intent4 = s.startTestPayment(ws, a);
+  receipts.set(TX(21), transferReceipt({ txHash: TX(21), to: RECIPIENT, amountRaw: BigInt(intent4.amountRaw) }));
   await s.completeTestPayment(ws, a, intent4.id, TX(21));
   const days = (Date.parse(ws.paidUntil) - first) / 86400000;
   assert.ok(days > LIMITS.PAID_DAYS - 0.01 && days <= LIMITS.PAID_DAYS, "a second verified transfer stacks 30 days");
@@ -249,9 +265,9 @@ test("only the workspace owner can confirm, and only against a live request", as
   const b = s.createUser("bob", "longenough1");
   const ws = s.createWorkspace(a, "Owner Only");
   s.joinWorkspace(ws, b);
-  receipts.set(TX(30), transferReceipt({ txHash: TX(30), to: RECIPIENT }));
 
   const intent = s.startTestPayment(ws, a);
+  receipts.set(TX(30), transferReceipt({ txHash: TX(30), to: RECIPIENT, amountRaw: BigInt(intent.amountRaw) }));
   await assert.rejects(() => s.completeTestPayment(ws, b, intent.id, TX(30)), (e) => e.status === 403);
   assert.equal(s.tier(ws), "free");
 
@@ -268,16 +284,18 @@ test("only the workspace owner can confirm, and only against a live request", as
 test("a workspace cannot drown in open payment requests", async () => {
   const s = freshStore();
   const { user: a, ws } = paidOwner(s, "intents");
-  for (let i = 0; i < LIMITS.MAX_PENDING_PAYMENT_INTENTS; i++) s.startTestPayment(ws, a);
+  const intents = [];
+  for (let i = 0; i < LIMITS.MAX_PENDING_PAYMENT_INTENTS; i++) intents.push(s.startTestPayment(ws, a));
   assert.throws(() => s.startTestPayment(ws, a), (e) => e.status === 429 && /open payment requests/.test(e.message));
+  assert.equal(new Set(intents.map((i) => i.amountRaw)).size, intents.length, "every open request carries its own amount");
 });
 
 test("the paid tier holds 25 members, the free tier 5", async () => {
   const s = freshStore();
   const a = s.createUser("alice", "longenough1");
   const ws = s.createWorkspace(a, "Cap Test");
-  receipts.set(TX(40), transferReceipt({ txHash: TX(40), to: RECIPIENT }));
   const intent = s.startTestPayment(ws, a);
+  receipts.set(TX(40), transferReceipt({ txHash: TX(40), to: RECIPIENT, amountRaw: BigInt(intent.amountRaw) }));
 
   const users = [];
   for (let i = 0; i < LIMITS.PAID_MAX_MEMBERS; i++) users.push(s.createUser(`member${i}`, "longenough1"));
@@ -305,8 +323,8 @@ test("paid workspaces keep history longer; free workspaces prune at 30 days", ()
   const a = s.createUser("alice", "longenough1");
   const free = s.createWorkspace(a, "Free Retention");
   const paid = s.createWorkspace(a, "Paid Retention");
-  receipts.set(TX(41), transferReceipt({ txHash: TX(41), to: RECIPIENT }));
   const intent = s.startTestPayment(paid, a);
+  receipts.set(TX(41), transferReceipt({ txHash: TX(41), to: RECIPIENT, amountRaw: BigInt(intent.amountRaw) }));
   return s.completeTestPayment(paid, a, intent.id, TX(41)).then(() => {
     const old = new Date(Date.now() - (LIMITS.RETENTION_DAYS + 10) * 86400000).toISOString(); // beyond free, inside paid
     for (const ws of [free, paid]) {
@@ -324,8 +342,8 @@ test("paid workspaces keep history longer; free workspaces prune at 30 days", ()
 test("deleting a workspace removes its payment records, in memory and on disk", async () => {
   const s = freshStore();
   const { user: a, ws } = paidOwner(s, "deletion");
-  receipts.set(TX(50), transferReceipt({ txHash: TX(50), to: RECIPIENT }));
   const intent = s.startTestPayment(ws, a);
+  receipts.set(TX(50), transferReceipt({ txHash: TX(50), to: RECIPIENT, amountRaw: BigInt(intent.amountRaw) }));
   await s.completeTestPayment(ws, a, intent.id, TX(50));
   assert.equal(s.paymentHistory(ws.id).length, 1);
 
@@ -341,6 +359,146 @@ test("deleting a workspace removes its payment records, in memory and on disk", 
   assert.equal(s2.db.workspaces.some((w) => w.id === ws.id), false);
   assert.equal((s2.db.payments || []).some((p) => p.wsId === ws.id), false);
   assert.equal((s2.db.paymentIntents || []).some((i) => i.wsId === ws.id), false);
+});
+
+// ---- binding a transfer to its request, and keeping it spent ----
+
+test("a transfer meant for one request cannot fund another, and a historical transfer cannot fund anything", async () => {
+  const s = freshStore();
+  const a = s.createUser("alice", "longenough1");
+  const wsA = s.createWorkspace(a, "Binding A");
+  const wsB = s.createWorkspace(a, "Binding B");
+  const intentA = s.startTestPayment(wsA, a);
+  const intentB = s.startTestPayment(wsB, a);
+  assert.notEqual(intentA.amountRaw, intentB.amountRaw, "two open requests never share an amount");
+
+  // a transfer sent for A's request, offered to B's: the amount is A's alone
+  receipts.set(TX(90), transferReceipt({ txHash: TX(90), to: RECIPIENT, amountRaw: BigInt(intentA.amountRaw) }));
+  await assert.rejects(
+    () => s.completeTestPayment(wsB, a, intentB.id, TX(90)),
+    (e) => e.status === 422 && /does not carry/.test(e.message),
+    "another request's transfer is the wrong amount here"
+  );
+  assert.equal(s.tier(wsB), "free");
+
+  // the same transfer is exactly right for the request it was sent for
+  await s.completeTestPayment(wsA, a, intentA.id, TX(90));
+  assert.equal(s.tier(wsA), "paid");
+
+  // a fresh request for B, and a transfer of the right size that was mined
+  // long before the request existed: not the transfer this request asked for
+  const intentC = s.startTestPayment(wsB, a);
+  const oldBlock = "0x100001";
+  blocks.set(oldBlock, { timestamp: Math.floor((Date.now() - 3600 * 1000) / 1000) });
+  receipts.set(TX(91), transferReceipt({ txHash: TX(91), to: RECIPIENT, amountRaw: BigInt(intentC.amountRaw), blockNumber: oldBlock }));
+  await assert.rejects(
+    () => s.completeTestPayment(wsB, a, intentC.id, TX(91)),
+    (e) => e.status === 422 && /before this payment request/.test(e.message),
+    "a historical transfer cannot grant access"
+  );
+  assert.equal(s.tier(wsB), "free");
+  assert.equal(s.paymentHistory(wsB.id).length, 0);
+
+  // the same size, mined after the request: that one confirms
+  receipts.set(TX(92), transferReceipt({ txHash: TX(92), to: RECIPIENT, amountRaw: BigInt(intentC.amountRaw) }));
+  await s.completeTestPayment(wsB, a, intentC.id, TX(92));
+  assert.equal(s.tier(wsB), "paid");
+});
+
+test("a used transfer stays used after its workspace is deleted, and after a reload", async () => {
+  const s = freshStore();
+  const a = s.createUser("alice", "longenough1");
+  const ws1 = s.createWorkspace(a, "Burn One");
+  const intent = s.startTestPayment(ws1, a);
+  receipts.set(TX(93), transferReceipt({ txHash: TX(93), to: RECIPIENT, amountRaw: BigInt(intent.amountRaw) }));
+  await s.completeTestPayment(ws1, a, intent.id, TX(93));
+
+  // deletion removes the payment records and the payer's handle…
+  s.deleteWorkspace(ws1);
+  assert.equal((s.db.payments || []).some((p) => p.wsId === ws1.id), false);
+  // …but the consumed-transfer ledger keeps the transaction out of play
+  assert.equal(s.db.consumedTransfers.some((t) => t.txHash === TX(93)), true, "the ledger survives the deletion");
+
+  const s2 = new Store(s.dir).init(); // and after a reload
+  const ws2 = s2.createWorkspace(a, "Burn Two");
+  const intent2 = s2.startTestPayment(ws2, a);
+  await assert.rejects(
+    () => s2.completeTestPayment(ws2, a, intent2.id, TX(93)),
+    (e) => e.status === 409,
+    "a deleted workspace's transfer cannot fund another workspace"
+  );
+  assert.equal(s2.tier(ws2), "free");
+});
+
+test("a transaction stays consumed even when its inclusion position changed", async () => {
+  const s = freshStore();
+  const { user: a, ws } = paidOwner(s, "reposition");
+  const intent = s.startTestPayment(ws, a);
+  receipts.set(TX(94), transferReceipt({ txHash: TX(94), to: RECIPIENT, amountRaw: BigInt(intent.amountRaw) }));
+  await s.completeTestPayment(ws, a, intent.id, TX(94));
+
+  // The same transaction, presented by the chain at a different block and log
+  // position: the identity that matters is the hash, not the location.
+  receipts.set(
+    TX(94),
+    transferReceipt({ txHash: TX(94), to: RECIPIENT, amountRaw: BigInt(intent.amountRaw), blockNumber: "0x999999", logIndex: "0x7" })
+  );
+  const intent2 = s.startTestPayment(ws, a);
+  await assert.rejects(() => s.completeTestPayment(ws, a, intent2.id, TX(94)), (e) => e.status === 409);
+  const days = (Date.parse(ws.paidUntil) - Date.now()) / 86400000;
+  assert.ok(days <= LIMITS.PAID_DAYS, "the re-presented transaction extended nothing");
+});
+
+test("two concurrent confirmations of one request grant exactly one entitlement", async () => {
+  const s = freshStore();
+  const { user: a, ws } = paidOwner(s, "race");
+  const intent = s.startTestPayment(ws, a);
+  receipts.set(TX(95), transferReceipt({ txHash: TX(95), to: RECIPIENT, amountRaw: BigInt(intent.amountRaw) }));
+  receipts.set(TX(96), transferReceipt({ txHash: TX(96), to: RECIPIENT, amountRaw: BigInt(intent.amountRaw) }));
+
+  rpcDelayMs = 60; // keep both confirmations in flight at once
+  try {
+    const [r1, r2] = await Promise.allSettled([
+      s.completeTestPayment(ws, a, intent.id, TX(95)),
+      s.completeTestPayment(ws, a, intent.id, TX(96))
+    ]);
+    const won = r1.status === "fulfilled" ? r1 : r2;
+    const lost = r1.status === "fulfilled" ? r2 : r1;
+    assert.equal(won.status, "fulfilled", "exactly one confirmation succeeds");
+    assert.equal(lost.status, "rejected");
+    assert.equal(lost.reason.status, 409, "the other is refused: the request is no longer open");
+    const days = (Date.parse(ws.paidUntil) - Date.now()) / 86400000;
+    assert.ok(days > LIMITS.PAID_DAYS - 0.01 && days <= LIMITS.PAID_DAYS, "exactly one 30-day grant, not two");
+    assert.equal(s.paymentHistory(ws.id).length, 1);
+    assert.equal(s.db.consumedTransfers.length, 1, "one transfer recorded as consumed");
+    assert.equal(s.db.paymentIntents.find((i) => i.id === intent.id).status, "settled");
+  } finally {
+    rpcDelayMs = 0;
+  }
+});
+
+test("a confirmation that finishes after the workspace was deleted grants nothing", async () => {
+  const s = freshStore();
+  const { user: a, ws } = paidOwner(s, "gone");
+  const intent = s.startTestPayment(ws, a);
+  receipts.set(TX(97), transferReceipt({ txHash: TX(97), to: RECIPIENT, amountRaw: BigInt(intent.amountRaw) }));
+
+  rpcDelayMs = 60;
+  try {
+    const pending = s.completeTestPayment(ws, a, intent.id, TX(97));
+    await new Promise((r) => setTimeout(r, 20)); // verification is still in flight
+    s.deleteWorkspace(ws);
+    await assert.rejects(
+      () => pending,
+      (e) => e.status === 410 && /deleted/.test(e.message),
+      "a deleted workspace's confirmation is refused"
+    );
+    assert.equal((s.db.payments || []).some((p) => p.wsId === ws.id), false, "no payment record recreated");
+    assert.equal((s.db.paymentIntents || []).some((i) => i.wsId === ws.id), false, "no request record recreated");
+    assert.equal(s.db.consumedTransfers.some((t) => t.txHash === TX(97)), false, "an unconfirmed transfer is not burned");
+  } finally {
+    rpcDelayMs = 0;
+  }
 });
 
 // ---- search over retained history ----
@@ -388,8 +546,8 @@ test("search reaches older paid-tier history that the free tier would have prune
   const a = s.createUser("alice", "longenough1");
   const free = s.createWorkspace(a, "Free Search");
   const paid = s.createWorkspace(a, "Paid Search");
-  receipts.set(TX(70), transferReceipt({ txHash: TX(70), to: RECIPIENT }));
   const intent = s.startTestPayment(paid, a);
+  receipts.set(TX(70), transferReceipt({ txHash: TX(70), to: RECIPIENT, amountRaw: BigInt(intent.amountRaw) }));
   return s.completeTestPayment(paid, a, intent.id, TX(70)).then(async () => {
     const old = new Date(Date.now() - (LIMITS.RETENTION_DAYS + 20) * 86400000).toISOString(); // beyond free, inside paid
     for (const ws of [free, paid]) {
@@ -453,7 +611,7 @@ test("the two-step test-payment endpoint verifies in-product, owner only", async
   assert.equal(start.body.asset, ASSET);
   assert.equal(start.body.recipient, RECIPIENT);
   assert.equal(start.body.amountUsdc, LIMITS.PAID_PRICE_USDC);
-  assert.equal(start.body.amountRaw, "12000000");
+  assert.match(start.body.amountRaw, /^120000[0-9]{2}$/, "the request's own binding amount");
 
   // step 2: an unverified hash cannot be confirmed into an entitlement
   const bad = await call("POST", `/api/ws/${slug}/pay-test/confirm`, { intentId: start.body.intentId, txHash: TX(60) }, owner);
@@ -462,7 +620,7 @@ test("the two-step test-payment endpoint verifies in-product, owner only", async
   assert.equal(info.tier, "free", "an unverified payment grants nothing");
 
   // the real, settled transfer verifies and grants the tier
-  receipts.set(TX(61), transferReceipt({ txHash: TX(61), to: RECIPIENT }));
+  receipts.set(TX(61), transferReceipt({ txHash: TX(61), to: RECIPIENT, amountRaw: BigInt(start.body.amountRaw) }));
   const pay = await call("POST", `/api/ws/${slug}/pay-test/confirm`, { intentId: start.body.intentId, txHash: TX(61) }, owner);
   assert.equal(pay.res.status, 200);
   assert.equal(pay.body.testPayment, true); // labelled as a test

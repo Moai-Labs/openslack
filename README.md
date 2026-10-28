@@ -1,23 +1,50 @@
-# About this repository
+# OpenSlack
 
-This repository holds an open-source product that is built in the open by an autonomous agent
-together with the people who hold its token. The agent writes the code, decides what to build
-next and ships it. Holders steer the work: they post ideas, discuss them and vote on what
-matters most. Everything the agent builds is public, here, from the first commit.
+Private team chat: sign-up accounts, workspaces, channels, live messages and ordinary
+invitation links, with server-side history that survives redeploys. Built in the open by
+an autonomous agent together with the people who hold its token.
 
-## How it runs
+## What works today
 
-- `Dockerfile` builds the product into one container image that serves on port 3000.
-- `deploy.json` describes the services to run: their image, size, port and whether they are
-  reachable from the internet. Changing this file is how the product's infrastructure changes.
-- `.github/workflows/build.yml` runs on every push to the default branch: it builds the image,
-  runs the tests when `package.json` has a `test` script, publishes the image to the GitHub
-  container registry tagged with the commit, and records the result as `refs/ci/pass/<commit>`
-  or `refs/ci/fail/<commit>`. An image named in `deploy.json` without a tag runs the commit
-  being deployed.
+- Private accounts: handle + password (salted scrypt), session cookie, no wallet needed.
+- Workspaces with a 5-member free tier, invitation links anyone can share.
+- Channels (a `#general` is created with every workspace) and live messages over SSE.
+- Durable history: every message is fsynced to an append-only log before the sender's
+  request is acknowledged; metadata is stored in an atomically replaced JSON file. The
+  data directory lives on a mounted volume (`deploy.json`) — a deployment refuses to
+  start on storage it cannot verify as a persistent volume, and `/healthz` reports the
+  verified `durable` flag — so messages survive SIGKILL, restart and redeploy.
+- Owner tools: full JSON export of a workspace, deletion of a workspace and its history.
+  `scripts/restore.js` rebuilds a workspace from an export (it takes exclusive
+  ownership of the data directory and refuses to run against a live server); members
+  regain access only through the administrator's verified `--attach` mapping — handles
+  alone never grant access.
+- Published limits (history, storage, retention): [docs/limits.md](docs/limits.md).
+- `scripts/persistence-check.js` proves the durability story end to end on synthetic
+  data: SIGKILL recovery, redeploy survival, restore from export, real deletion. It
+  only ever touches an empty (or freshly created) data directory, so it cannot damage
+  a live store.
 
-Today the image serves a placeholder page. The product replaces it.
+## Running
 
-## Licence
+- `npm test` — unit, end-to-end API and browser-level (jsdom) tests. The server itself
+  has no npm dependencies; Node 22 standard library only (jsdom is a dev dependency for
+  the browser tests).
+- `npm run check` — the persistence check described above.
+- `npm start` — serves on `$PORT` (default 3000), storing data in `$DATA_DIR` (default
+  `./data`; in production this is the mounted volume, and `/healthz` reports the path).
 
-No licence has been chosen yet; see `LICENSE`.
+## How it deploys
+
+- `Dockerfile` builds the product into one container image serving port 3000.
+- `deploy.json` runs one public web service with a 1 GB persistent volume mounted for
+  message storage.
+- `.github/workflows/build.yml` builds, tests and publishes the image per commit and
+  records the verdict as `refs/ci/pass|fail/<sha>`.
+
+## What is deliberately out
+
+Voice, file hosting, bots and token gates (deferred by the adopted direction), message
+editing, read receipts, real payments. The paid tier exists only through labelled,
+chain-verified test-USDC payments (see docs/limits.md); real payments stay blocked
+until a supported checkout with verified settlement exists.

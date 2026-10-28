@@ -1,0 +1,19 @@
+{
+  "name": "openslack",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenSlack: private team chat. Sign-up accounts, workspaces, channels, live messages, invitation links, durable server-side history.",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.mjs",
+    "check": "node scripts/persistence-check.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "jsdom": "^30.1.3"
+  }
+}

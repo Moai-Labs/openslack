@@ -499,3 +499,73 @@ test("a failed directory commit on log compaction leaves the in-memory state unt
   s.saveLog(s.messages.slice(0, 1));
   assert.equal(s.messages.length, 1, "compaction succeeds once the directory commit works");
 });
+
+// ---- append failure rollback ----
+// A mid-append storage failure must leave no torn record behind: the next
+// successful append would otherwise glue onto the torn bytes and the log
+// would refuse to load on restart, making every acknowledged message since
+// unreadable. These tests inject a partial write followed by an error.
+
+// Makes the first writeSync write only a few bytes and then fail with EIO.
+function failAppendPartway() {
+  const realWriteSync = fs.writeSync;
+  let fired = false;
+  fs.writeSync = (fd, buf, off, len) => {
+    if (!fired) {
+      fired = true;
+      realWriteSync(fd, buf, off, Math.min(3, len)); // the torn partial write
+      const err = new Error("injected EIO mid-append");
+      err.code = "EIO";
+      throw err;
+    }
+    return realWriteSync(fd, buf, off, len);
+  };
+  return () => { fs.writeSync = realWriteSync; };
+}
+
+test("a partially written append is rolled back to a record boundary and the log stays loadable", () => {
+  const s = freshStore();
+  const a = s.createUser("rollbackowner", "long enough password");
+  const ws = s.createWorkspace(a, "Rollback");
+  const ch = s.channelsFor(ws.id)[0];
+  const msg = (id, text) => ({ id: String(id), wsId: ws.id, chId: ch.id, userId: a.id, handle: a.handle, text, at: new Date().toISOString() });
+  s.appendMessage(msg(1, "first"));
+  const sizeBefore = fs.statSync(s.logPath).size;
+  const restore = failAppendPartway();
+  assert.throws(() => s.appendMessage(msg(2, "torn")), /EIO/, "the failed append is not acknowledged");
+  restore();
+  assert.equal(fs.statSync(s.logPath).size, sizeBefore, "no torn bytes remain after the rollback");
+  assert.equal(s.messages.length, 1, "the failed message is not in memory either");
+  s.appendMessage(msg(3, "after failure")); // the next append starts at a clean record boundary
+  assert.equal(s.messages.length, 2);
+  const reloaded = new Store(s.dir).init();
+  assert.equal(reloaded.messages.length, 2, "the restarted store loads the log without refusing");
+  assert.equal(reloaded.messages[1].text, "after failure");
+});
+
+test("when the rollback itself fails the store refuses every further append", () => {
+  const s = freshStore();
+  const a = s.createUser("rollfailowner", "long enough password");
+  const ws = s.createWorkspace(a, "Rollfail");
+  const ch = s.channelsFor(ws.id)[0];
+  const msg = (id, text) => ({ id: String(id), wsId: ws.id, chId: ch.id, userId: a.id, handle: a.handle, text, at: new Date().toISOString() });
+  s.appendMessage(msg(1, "first"));
+  const sizeBefore = fs.statSync(s.logPath).size;
+  const realTruncate = fs.truncateSync;
+  fs.truncateSync = (p, len) => {
+    const err = new Error("injected EIO on rollback truncate");
+    err.code = "EIO";
+    throw err;
+  };
+  const restoreWrite = failAppendPartway();
+  assert.throws(() => s.appendMessage(msg(2, "torn")), /EIO/, "the failed append is not acknowledged");
+  fs.truncateSync = realTruncate;
+  restoreWrite();
+  // The torn record could not be removed, so the log's contents are unknown:
+  // the store must not acknowledge anything else, and must not glue the next
+  // message onto the torn bytes.
+  assert.throws(() => s.appendMessage(msg(3, "refused")), /unknown state/, "further appends are refused");
+  assert.throws(() => s.appendMessage(msg(3, "refused")), /unknown state/, "the refusal persists");
+  assert.equal(s.messages.length, 1, "no refused message reached memory");
+  assert.equal(fs.statSync(s.logPath).size, sizeBefore + 3, "the log was not extended past the torn bytes");
+});

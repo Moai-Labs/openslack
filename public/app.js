@@ -158,18 +158,18 @@ function initChat() {
   const slug = document.querySelector("#chat").dataset.slug;
   let current = "general";
   // The recovery cursor: the highest message id fully accounted for the
-  // current channel. It advances only when a message is rendered (live
-  // delivery is id-ordered per workspace, so receiving id N means nothing
-  // lower is still coming) or when a fetched history page advances it — never
-  // from a live event that arrived while a catch-up was still filling the gap.
+  // current channel. It advances only when a message is rendered through
+  // accept — which happens only once the cursor is known to be contiguous —
+  // or when a fetched history page advances it. A live event that arrives
+  // while the cursor is not contiguous (initial history still loading, or a
+  // gap open) waits in the buffer and never touches the cursor.
   let cursor = 0;
   let historyGen = 0; // bumped on every switch; stale history responses are dropped
   let channelReady = false; // the current channel's initial history has rendered
   let streamOpen = false; // the SSE transport's state, kept honest for recovery decisions
   let recoveryOwed = false; // the stream may have missed events; no successful catch-up has closed the gap yet
   let recovering = null; // { channel, gen, active } while a catch-up attempt is open or awaiting retry
-  let pendingLive = []; // live events held while a gap is open (catch-up in flight or failed)
-  let pendingInitial = []; // events that arrived before the first history rendered
+  let buffer = []; // live events held while the recovery cursor is not yet trustworthy
   let recoveryRetry = null; // timer for the next catch-up attempt after a failure
   let role = "member";
 
@@ -196,24 +196,39 @@ function initChat() {
     return true;
   };
 
-  // A live event with a fully-recovered past: render it and advance the
-  // cursor. Events that arrive before their channel's history exists are
-  // held and flushed after the history, so the log stays in id order.
+  // A live event whose whole past is already accounted for: render it and
+  // advance the cursor. Only ever called while the cursor is known to be
+  // contiguous — never while events are being buffered.
   const accept = (m) => {
     const id = Number(m.id);
     if (id > cursor) cursor = id;
-    if (channelReady) renderRow(m);
-    else pendingInitial.push(m);
+    renderRow(m);
   };
 
-  // Live delivery. While a catch-up is in flight nothing is rendered and the
-  // cursor does not move: events wait in pendingLive, and after the catch-up
-  // they are drained in id order (the stream delivers per-workspace events
-  // in id order, so sorting the buffer restores the true order).
+  // The cursor may only advance over rendered messages, so it is not
+  // trustworthy — and live events must wait in the buffer — while
+  //   - the channel's initial history has not rendered yet: the cursor comes
+  //     from that history, and a live event arriving during the load may be
+  //     newer than messages the history response — possibly captured before
+  //     a disconnect — never contained, or
+  //   - a gap is open: a reconnect was noticed, or a catch-up is in flight
+  //     or awaiting retry.
+  // Committing such an event would push the cursor past messages the owed
+  // recovery has not fetched yet, and they would be skipped for good.
+  const buffering = () => !channelReady || recovering || recoveryOwed;
   const ingest = (m) => {
     if (m.channel !== current) return;
-    if (recovering) pendingLive.push(m);
+    if (buffering()) buffer.push(m);
     else accept(m);
+  };
+
+  // Drain the buffer in id order (the stream delivers per-workspace events
+  // in id order, so sorting restores the true order). Rows already recovered
+  // by a catch-up dedupe here; anything newer than the cursor renders after
+  // everything rendered so far.
+  const drainBuffered = () => {
+    const held = buffer.splice(0).sort((a, b) => Number(a.id) - Number(b.id));
+    for (const m of held) accept(m);
   };
 
   async function fetchHistory(channel, after, limit) {
@@ -236,9 +251,18 @@ function initChat() {
       renderRow(m);
     }
     channelReady = true;
-    for (const m of pendingInitial.splice(0)) renderRow(m); // held live events, now in place
     log.scrollTop = log.scrollHeight;
-    if (recoveryOwed && streamOpen) catchUp(channel).catch(() => {});
+    // Owed recovery runs first, from the cursor this history derived — never
+    // from a buffered event's id. The buffered events drain only once the gap
+    // below them is closed: a failed catch-up leaves them (and the gap) to its
+    // retry, so nothing can render ahead of messages still being recovered.
+    if (recoveryOwed && streamOpen) {
+      await catchUp(channel).catch(() => {});
+      if (gen !== historyGen || channel !== current) return; // switched during recovery
+    } else {
+      drainBuffered();
+    }
+    log.scrollTop = log.scrollHeight;
   }
 
   // Catch up on everything missed while the stream was down, oldest first,
@@ -247,7 +271,7 @@ function initChat() {
   // leaves the cursor and the buffered live events untouched and retries, so
   // no message is ever skipped and no live event can advance past it. Each
   // fetched page advances the cursor itself; live events arriving during the
-  // catch-up never do.
+  // catch-up wait in the buffer and are drained, in id order, on success.
   async function catchUp(channel) {
     if (channel !== current || !channelReady) return;
     if (recovering && recovering.active) return; // one attempt at a time
@@ -282,8 +306,7 @@ function initChat() {
     if (recovering && recovering.channel === channel && recovering.gen === gen && gen === historyGen && channel === current) {
       recovering = null;
       recoveryOwed = false;
-      const held = pendingLive.splice(0).sort((a, b) => Number(a.id) - Number(b.id));
-      for (const m of held) accept(m);
+      drainBuffered();
     }
   }
 
@@ -293,8 +316,7 @@ function initChat() {
     if (recoveryRetry) { clearTimeout(recoveryRetry); recoveryRetry = null; }
     current = name;
     cursor = 0;
-    pendingLive = [];
-    pendingInitial = [];
+    buffer = [];
     log.textContent = "";
     $("#ch-name").textContent = "#" + name;
     document.querySelectorAll("#channels button").forEach((b) => b.classList.toggle("active", b.textContent === "#" + name));

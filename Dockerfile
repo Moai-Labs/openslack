@@ -19,8 +19,14 @@ USER node
 # the locked descriptor and the kernel drops the lock when that process dies,
 # however it dies. (The `flock FILE COMMAND` form would fork the command and
 # leave the lock with a parent that outlives the intended owner.)
+# The lock is retried for up to 30 seconds: during a deploy the replaced
+# container can still hold the lock while it is being torn down, and an
+# instant exit there would leave the new machine running with nothing
+# listening until the next deploy. A lock that is still held after 30 seconds
+# belongs to a live owner, and exiting (160, the wrapper's refusal code) is
+# then the only honest move — never a takeover.
 # OPENSLACK_LOCK_FD/OPENSLACK_LOCK_FILE tell the server it already runs under
 # flock, so it does not re-exec itself; they are set per-process, never
 # image-wide, so a restore started with docker exec still has to acquire the
 # lock itself.
-CMD ["sh", "-c", "exec 9>>/data/.owner.lock; flock -x -n 9 || exit 1; export OPENSLACK_LOCK_FD=9 OPENSLACK_LOCK_FILE=/data/.owner.lock; exec node server.js"]
+CMD ["sh", "-c", "exec 9>>/data/.owner.lock; n=0; until flock -x -n 9; do n=$((n+1)); if [ $n -ge 30 ]; then echo 'refusing to start: the data directory is owned by another live process' >&2; exit 160; fi; sleep 1; done; export OPENSLACK_LOCK_FD=9 OPENSLACK_LOCK_FILE=/data/.owner.lock; exec node server.js"]

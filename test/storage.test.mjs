@@ -105,49 +105,90 @@ test("unavailable mount information is reported as unverifiable, never as durabl
 
 // ---- production startup: the gate the deployment runs behind ----
 
-function startProd(dataDir, env = {}) {
-  return new Promise((resolve) => {
-    const child = spawn(NODE, [path.join(ROOT, "server.js")], {
-      env: { ...process.env, NODE_ENV: "production", PORT: "0", DATA_DIR: dataDir || "", ...env },
-      stdio: ["ignore", "pipe", "pipe"]
-    });
-    let out = "";
-    child.stdout.on("data", (d) => (out += d));
-    child.stderr.on("data", (d) => (out += d));
-    child.on("exit", (code) => resolve({ code, out }));
-    setTimeout(() => {
-      if (child.exitCode == null) {
-        child.kill("SIGKILL");
-        resolve({ code: "timeout", out });
-      }
-    }, 10000).unref();
+// A refused production start is degraded, not dead: it binds the port and
+// serves the verdict (503, durable:false, the reason) on /healthz and 503
+// everywhere else, having opened no store and touched no data — so the
+// failure stays diagnosable from outside instead of leaving a machine that
+// accepts connections and answers nothing. This helper starts such a server
+// on a concrete port, waits for /healthz to answer, and returns the verdict
+// plus a stop() that SIGTERMs it and resolves on exit.
+async function refusedServer(dataDir, env = {}) {
+  const port = 19000 + Math.floor(Math.random() * 1000);
+  const child = spawn(NODE, [path.join(ROOT, "server.js")], {
+    env: { ...process.env, NODE_ENV: "production", PORT: String(port), DATA_DIR: dataDir || "", ...env },
+    stdio: ["ignore", "pipe", "pipe"]
   });
+  let out = "";
+  child.stdout.on("data", (d) => (out += d));
+  child.stderr.on("data", (d) => (out += d));
+  const stop = () =>
+    new Promise((resolve) => {
+      child.on("exit", (code) => resolve(code));
+      child.kill("SIGTERM");
+    });
+  let res = null;
+  try {
+    for (let i = 0; i < 100 && !res; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+      try {
+        res = await fetch(`http://127.0.0.1:${port}/healthz`);
+      } catch {}
+    }
+    assert.ok(res, `the degraded server must answer /healthz: ${out.slice(0, 300)}`);
+    return { port, res, body: await res.json(), out, stop };
+  } catch (err) {
+    child.kill("SIGKILL");
+    throw err;
+  }
 }
 
-test("production refuses to start without DATA_DIR", async () => {
-  const r = await startProd("");
-  assert.equal(r.code, 1);
-  assert.match(r.out, /DATA_DIR is not set/);
+test("production without DATA_DIR serves its refusal instead of vanishing", async () => {
+  const { port, res, body, out, stop } = await refusedServer("");
+  try {
+    assert.equal(res.status, 503);
+    assert.equal(body.durable, false);
+    assert.match(body.reason, /DATA_DIR is not set/);
+    assert.match(out, /refusing to serve private data/);
+    // Everything but /healthz is refused too: no pages, no API, no store.
+    const other = await fetch(`http://127.0.0.1:${port}/`);
+    assert.equal(other.status, 503);
+  } finally {
+    assert.equal(await stop(), 0, "SIGTERM shuts the degraded server down cleanly");
+  }
 });
 
-test("production refuses a writable DATA_DIR that is not persistent storage", async () => {
+test("production refuses a writable DATA_DIR that is not persistent storage, without opening a store", async () => {
   // A temp directory is writable, but no verdict may call it durable: on this
   // machine it sits on the container's own (overlay) filesystem.
   const local = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-prod-local-"));
-  const r = await startProd(local);
-  assert.equal(r.code, 1);
-  assert.match(r.out, /refusing to start/);
-  assert.match(r.out, /own filesystem|temporary|not inside/);
-  fs.rmSync(local, { recursive: true, force: true });
+  const { port, res, body, out, stop } = await refusedServer(local);
+  try {
+    assert.equal(res.status, 503);
+    assert.equal(body.durable, false);
+    assert.match(body.reason, /own filesystem|temporary|not inside/);
+    assert.match(out, /refusing to serve private data/);
+    const other = await fetch(`http://127.0.0.1:${port}/app.js`);
+    assert.equal(other.status, 503, "no static assets are served in a degraded start");
+    // The refusal must not have created a store it does not trust.
+    assert.deepEqual(fs.readdirSync(local), [], "the data directory stays untouched");
+  } finally {
+    await stop();
+    fs.rmSync(local, { recursive: true, force: true });
+  }
 });
 
 test("production refuses a separate but temporary mount (/dev/shm)", async () => {
   if (!fs.existsSync("/dev/shm")) return;
   const dir = fs.mkdtempSync("/dev/shm/openslack-prod-");
-  const r = await startProd(dir);
-  assert.equal(r.code, 1, "a tmpfs mount must not count as persistent storage");
-  assert.match(r.out, /tmpfs|does not survive|temporary/);
-  fs.rmSync(dir, { recursive: true, force: true });
+  const { res, body, stop } = await refusedServer(dir);
+  try {
+    assert.equal(res.status, 503, "a tmpfs mount must not count as persistent storage");
+    assert.equal(body.durable, false);
+    assert.match(body.reason, /tmpfs|does not survive|temporary/);
+  } finally {
+    await stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("production refuses tmpfs at a non-denylisted path", async () => {
@@ -158,11 +199,15 @@ test("production refuses tmpfs at a non-denylisted path", async () => {
   const fake = `29 1 0:21 / / rw,relatime - overlay none rw\n60 29 0:99 / ${local} rw - tmpfs scratch rw\n`;
   const mi = path.join(os.tmpdir(), `openslack-mi-${process.pid}`);
   fs.writeFileSync(mi, fake);
-  const r = await startProd(local, { OPENSLACK_MOUNTINFO_FILE: mi });
-  assert.equal(r.code, 1, "tmpfs must be refused wherever it is mounted");
-  assert.match(r.out, /tmpfs/);
-  fs.rmSync(mi, { force: true });
-  fs.rmSync(local, { recursive: true, force: true });
+  const { res, body, stop } = await refusedServer(local, { OPENSLACK_MOUNTINFO_FILE: mi });
+  try {
+    assert.equal(res.status, 503, "tmpfs must be refused wherever it is mounted");
+    assert.match(body.reason, /tmpfs/);
+  } finally {
+    await stop();
+    fs.rmSync(mi, { force: true });
+    fs.rmSync(local, { recursive: true, force: true });
+  }
 });
 
 test("production refuses a symlink alias to temporary storage", async () => {
@@ -170,11 +215,15 @@ test("production refuses a symlink alias to temporary storage", async () => {
   const hidden = fs.mkdtempSync("/dev/shm/openslack-alias-");
   const alias = path.join(os.tmpdir(), `openslack-alias-${process.pid}`);
   fs.symlinkSync(hidden, alias);
-  const r = await startProd(alias);
-  assert.equal(r.code, 1, "an alias to /dev/shm must not count as persistent storage");
-  assert.match(r.out, /tmpfs|does not survive|temporary/);
-  fs.rmSync(alias, { force: true });
-  fs.rmSync(hidden, { recursive: true, force: true });
+  const { res, body, stop } = await refusedServer(alias);
+  try {
+    assert.equal(res.status, 503, "an alias to /dev/shm must not count as persistent storage");
+    assert.match(body.reason, /tmpfs|does not survive|temporary/);
+  } finally {
+    await stop();
+    fs.rmSync(alias, { force: true });
+    fs.rmSync(hidden, { recursive: true, force: true });
+  }
 });
 
 test("production refuses an unwritable DATA_DIR", async () => {
@@ -182,11 +231,15 @@ test("production refuses an unwritable DATA_DIR", async () => {
   const base = path.join(process.cwd(), `openslack-prod-ro-${process.pid}`);
   fs.mkdirSync(base);
   fs.chmodSync(base, 0o555);
-  const r = await startProd(path.join(base, "data"));
-  assert.equal(r.code, 1);
-  assert.match(r.out, /refusing to start/);
-  fs.chmodSync(base, 0o755);
-  fs.rmSync(base, { recursive: true, force: true });
+  const { res, body, stop } = await refusedServer(path.join(base, "data"));
+  try {
+    assert.equal(res.status, 503);
+    assert.match(body.reason, /cannot be created|not writable/);
+  } finally {
+    await stop();
+    fs.chmodSync(base, 0o755);
+    fs.rmSync(base, { recursive: true, force: true });
+  }
 });
 
 // The positive case needs a real, non-ephemeral filesystem of its own to

@@ -34,6 +34,16 @@ await onceReady(port);
 const j = async (r) => ({ status: r.status, body: await r.json().catch(() => ({})) });
 const cookieOf = (r) => (r.headers.get("set-cookie") || "").split(";")[0];
 
+async function until(fn, what, ms = 3000) {
+  const end = Date.now() + ms;
+  for (;;) {
+    const v = await fn();
+    if (v) return v;
+    if (Date.now() > end) throw new Error(`timeout waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
 async function call(method, p, body, cookie) {
   const res = await fetch(`http://127.0.0.1:${port}${p}`, {
     method,
@@ -251,15 +261,28 @@ test("the restore command never mistakes an unrelated workspace for a restore of
 });
 
 test("pages and static assets are served", async () => {
-  const home = await fetch(`http://127.0.0.1:${port}/`);
+  // A GET here can hit a keep-alive socket the server idled out (5 s) while
+  // the previous test's synchronous restore runs blocked this event loop;
+  // the connection then resets and undici reports "fetch failed". Browsers
+  // retry a reset idempotent GET the same way.
+  const get = async (p) => {
+    let err;
+    for (let i = 0; i < 3; i++) {
+      try {
+        return await fetch(`http://127.0.0.1:${port}${p}`);
+      } catch (e) {
+        err = e;
+      }
+    }
+    throw err;
+  };
+  const home = await get("/");
   assert.match(await home.text(), /OpenSlack/);
-  const js = await fetch(`http://127.0.0.1:${port}/app.js`);
-  assert.equal(js.status, 200);
-  const css = await fetch(`http://127.0.0.1:${port}/style.css`);
-  assert.equal(css.status, 200);
-  const joinPage = await fetch(`http://127.0.0.1:${port}/join/abc123`);
+  assert.equal((await get("/app.js")).status, 200);
+  assert.equal((await get("/style.css")).status, 200);
+  const joinPage = await get("/join/abc123");
   assert.match(await joinPage.text(), /Join a workspace/);
-  assert.equal((await fetch(`http://127.0.0.1:${port}/w/UPPER`)).status, 404);
+  assert.equal((await get("/w/UPPER")).status, 404);
   assert.equal((await call("POST", "/api/nope")).res.status, 404);
 });
 
@@ -374,6 +397,185 @@ test("shutdown holds the data directory until in-flight requests finish", async 
     child.kill("SIGKILL");
     await Promise.race([exited, new Promise((r) => setTimeout(r, 1000))]);
   }
+});
+
+// A mutation request whose JSON body is only partly delivered: the server has
+// taken the headers and is waiting for the rest, which lets the test change
+// the world (delete the workspace) before the body completes.
+function pendingBody(method, path, cookie, body) {
+  const req = http.request({
+    host: "127.0.0.1",
+    port,
+    path,
+    method,
+    headers: { "content-type": "application/json", cookie, "content-length": String(body.length) }
+  });
+  req.on("error", () => {}); // the outcome is asserted, not crashed on
+  req.write(body.slice(0, 2)); // just "{"
+  return () =>
+    new Promise((resolve, reject) => {
+      req.on("response", (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => resolve({ status: res.statusCode, body: JSON.parse(data || "{}") }));
+      });
+      req.on("error", reject);
+      req.end(body.slice(2));
+    });
+}
+
+test("a workspace deleted while a channel-creation body is pending leaves no orphan channel", async () => {
+  const a = cookieOf((await call("POST", "/api/signup", { handle: "vanisher", password: "longenough1" })).res);
+  const ws = (await call("POST", "/api/workspaces", { name: "Vanish While Pending" }, a)).body;
+
+  const finish = pendingBody("POST", `/api/ws/${ws.slug}/channels`, a, JSON.stringify({ name: "doomed" }));
+  await new Promise((r) => setTimeout(r, 300)); // the server is now waiting for the body
+  assert.equal((await call("DELETE", `/api/ws/${ws.slug}`, null, a)).res.status, 200, "the owner deletes while the body is pending");
+
+  const res = await finish();
+  assert.equal(res.status, 404, "the mutation is refused against the deleted workspace");
+
+  // No orphan metadata anywhere: not in the live API, not on disk.
+  const me = await call("GET", "/api/me", null, a);
+  assert.ok(!me.body.workspaces.some((w) => w.slug === ws.slug));
+  const db = JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR, "db.json"), "utf8"));
+  assert.ok(!db.channels.some((c) => c.name === "doomed"), "no orphan channel record on disk");
+  assert.ok(!db.workspaces.some((w) => w.id === ws.id), "the workspace record is gone");
+  assert.ok(!db.members.some((x) => x.wsId === ws.id), "no membership rows left behind");
+});
+
+test("a workspace deleted while a message body is pending acknowledges nothing and stores nothing", async () => {
+  const a = cookieOf((await call("POST", "/api/signup", { handle: "vanisher2", password: "longenough1" })).res);
+  const ws = (await call("POST", "/api/workspaces", { name: "Vanish Mid Message" }, a)).body;
+  assert.equal((await call("POST", `/api/ws/${ws.slug}/channels/general/messages`, { text: "kept" }, a)).res.status, 201);
+
+  const text = "posted for a deleted workspace";
+  const finish = pendingBody("POST", `/api/ws/${ws.slug}/channels/general/messages`, a, JSON.stringify({ text }));
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal((await call("DELETE", `/api/ws/${ws.slug}`, null, a)).res.status, 200);
+
+  const res = await finish();
+  assert.equal(res.status, 404, "the message is not acknowledged for a deleted workspace");
+
+  // Nothing was written for it: not in the log on disk, not recoverable by a
+  // fresh store (the old bug acknowledged a message the next restart pruned).
+  const log = fs.readFileSync(path.join(process.env.DATA_DIR, "messages.jsonl"), "utf8");
+  assert.ok(!log.includes(text), "no message record in the log for the deleted workspace");
+  const { Store } = await import("../lib/store.js");
+  const store = new Store(process.env.DATA_DIR).init();
+  assert.ok(!store.messages.some((m) => m.text === text), "a fresh store recovers no such message");
+  assert.ok(!store.db.workspaces.some((w) => w.id === ws.id), "the workspace stays deleted");
+});
+
+test("logging out ends a stream's live delivery; another session keeps receiving", async () => {
+  const make = async (handle) => cookieOf((await call("POST", "/api/signup", { handle, password: "longenough1" })).res);
+  const owner = await make("streamowner");
+  const leaver = await make("streamleaver");
+  const ws = (await call("POST", "/api/workspaces", { name: "Stream Auth" }, owner)).body;
+  const inv = (await call("POST", "/api/invites", { slug: ws.slug }, owner)).body;
+  assert.equal((await call("POST", `/api/invites/${inv.token}/join`, null, leaver)).res.status, 200);
+
+  const openStream = async (cookie) => {
+    const res = await fetch(`http://127.0.0.1:${port}/api/ws/${ws.slug}/stream`, { headers: { cookie } });
+    assert.equal(res.headers.get("content-type"), "text/event-stream");
+    const state = { events: [], ended: false };
+    (async () => {
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) {
+            state.ended = true;
+            return;
+          }
+          const buf = (state._buf = (state._buf || "") + dec.decode(value, { stream: true }));
+          let i;
+          while ((i = buf.indexOf("\n\n")) >= 0) {
+            const chunk = buf.slice(0, i);
+            state._buf = buf.slice(i + 2);
+            if (chunk.startsWith("event: message")) state.events.push(JSON.parse(chunk.split("data: ")[1]));
+          }
+          state._reader = reader;
+        }
+      } catch {
+        state.ended = true;
+      }
+    })();
+    await new Promise((r) => setTimeout(r, 150)); // let the server register the stream
+    return state;
+  };
+
+  const stay = await openStream(owner);
+  const gone = await openStream(leaver);
+  await call("POST", `/api/ws/${ws.slug}/channels/general/messages`, { text: "before logout" }, owner);
+  await until(() => stay.events.some((e) => e.text === "before logout") && gone.events.some((e) => e.text === "before logout"), "both streams delivered");
+
+  // Logging out must terminate that session's stream — not the other's.
+  assert.equal((await call("POST", "/api/logout", null, leaver)).res.status, 200);
+  await until(() => gone.ended, "the logged-out stream is terminated");
+  assert.equal(stay.ended, false, "the other session's stream is untouched");
+
+  await call("POST", `/api/ws/${ws.slug}/channels/general/messages`, { text: "after logout" }, owner);
+  await until(() => stay.events.some((e) => e.text === "after logout"), "the valid session still receives");
+  await new Promise((r) => setTimeout(r, 150));
+  assert.ok(!gone.events.some((e) => e.text === "after logout"), "the logged-out session received nothing more");
+
+  // And the logged-out session really is gone: the API refuses it.
+  assert.equal((await call("GET", `/api/ws/${ws.slug}`, null, leaver)).res.status, 401);
+  if (stay._reader) stay._reader.cancel().catch(() => {});
+});
+
+test("an expired session's stream is terminated by broadcast and heartbeat, without being refreshed", async () => {
+  const { Store } = await import("../lib/store.js");
+  const { Api } = await import("../lib/api.js");
+  const { default: LIMITS } = await import("../lib/limits.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-streamauth-"));
+  const store = new Store(dir).init();
+  const u1 = store.createUser("streamer", "longenough1");
+  const u2 = store.createUser("bystander", "longenough1");
+  const t1 = store.createSession(u1.id);
+  const t2 = store.createSession(u2.id);
+  const ws = store.createWorkspace(u1, "Stream Expiry");
+  store.joinWorkspace(ws, u2);
+
+  // Fake SSE responses: writes are recorded, end() is observable.
+  const fakeRes = () => ({ writes: [], ended: false, write(c) { this.writes.push(c); }, end() { this.ended = true; } });
+  const s1 = { res: fakeRes(), wsId: ws.id, userId: u1.id, token: t1 };
+  const s2 = { res: fakeRes(), wsId: ws.id, userId: u2.id, token: t2 };
+  const api = new Api(store);
+  api.streams.add(s1);
+  api.streams.add(s2);
+
+  api.broadcast(ws.id, { type: "message", text: "one" });
+  assert.ok(s1.res.writes.some((w) => w.includes("one")), "a valid session receives live messages");
+  assert.ok(s2.res.writes.some((w) => w.includes("one")));
+
+  // The session expires (idle past the published lifetime): broadcast must
+  // deliver nothing further and terminate the stream.
+  const sess = store.db.sessions.find((x) => x.token === t1);
+  sess.lastSeen = new Date(Date.now() - (LIMITS.SESSION_DAYS + 1) * 86400000).toISOString();
+  api.broadcast(ws.id, { type: "message", text: "two" });
+  assert.ok(!s1.res.writes.some((w) => w.includes("two")), "an expired session receives nothing");
+  assert.equal(s1.res.ended, true, "the expired stream is terminated");
+  assert.ok(!api.streams.has(s1));
+
+  // Periodic maintenance ends expired streams too, and never refreshes
+  // session activity merely by pinging.
+  api.heartbeat();
+  assert.ok(!s1.res.writes.some((w) => w.includes("ping")));
+  assert.equal(store.db.sessions.find((x) => x.token === t1).lastSeen, sess.lastSeen, "heartbeat did not refresh the expired session");
+
+  // The valid session keeps receiving across all of it.
+  api.broadcast(ws.id, { type: "message", text: "three" });
+  assert.ok(s2.res.writes.some((w) => w.includes("three")), "the valid session is unaffected");
+  assert.equal(s2.res.ended, false);
+
+  // Logout removes the session and its stream with it.
+  store.dropSession(t2);
+  api.endStreamsFor(t2);
+  assert.equal(s2.res.ended, true, "logout terminates the stream");
+  assert.ok(!api.streams.has(s2));
 });
 
 test("server shuts down cleanly", async () => {

@@ -20,8 +20,8 @@ const isProduction = process.env.NODE_ENV === "production";
 // Writability alone proves nothing — a container-local path is writable and
 // still loses every message at the next deploy — so durability is claimed
 // only for a writable path on the volume's own filesystem (see
-// lib/storage.js), and a deployment that cannot provide one refuses to start
-// rather than quietly accepting private data it cannot keep.
+// lib/storage.js), and a deployment that cannot provide one refuses to serve
+// private data rather than quietly accepting data it cannot keep.
 function resolveDataDir() {
   const wanted = process.env.DATA_DIR;
   if (wanted) {
@@ -30,8 +30,7 @@ function resolveDataDir() {
     } catch (err) {
       const message = `DATA_DIR ${wanted} cannot be created: ${err.message}`;
       if (isProduction) {
-        console.error(`refusing to start: ${message} Check the volume mount and the node user's write permission.`);
-        process.exit(1);
+        return { dir: wanted, durable: false, refusal: `${message} Check the volume mount and the node user's write permission.` };
       }
       console.error(`${message}; falling back to local storage.`);
       return { dir: path.join(process.cwd(), "data"), durable: false };
@@ -50,22 +49,67 @@ function resolveDataDir() {
     if (verdict.durable) return { dir: path.resolve(wanted), durable: true };
     const message = `DATA_DIR ${wanted} is ${verdict.reason}, so nothing written there is guaranteed to survive a redeploy.`;
     if (isProduction) {
-      console.error(`refusing to start: ${message} Mount the persistent volume there.`);
-      process.exit(1);
+      return { dir: path.resolve(wanted), durable: false, refusal: `${message} Mount the persistent volume there.` };
     }
     console.warn(`warning: ${message} /healthz will report storage.durable=false.`);
     return { dir: path.resolve(wanted), durable: false };
   }
   if (isProduction) {
-    console.error("refusing to start: DATA_DIR is not set; without it messages live on the container's own filesystem and a redeploy loses them.");
-    process.exit(1);
+    return { dir: null, durable: false, refusal: "DATA_DIR is not set; without it messages live on the container's own filesystem and a redeploy loses them." };
   }
   const local = path.join(process.cwd(), "data");
   fs.mkdirSync(local, { recursive: true });
   return { dir: local, durable: false };
 }
 
-const { dir: dataDir, durable } = resolveDataDir();
+// A production start that cannot verify durable storage never opens the
+// store — but it must not vanish, either: a process that just exits leaves
+// the deployment's machine accepting connections and answering nothing,
+// which is undiagnosable from outside (exactly the state a deployed refusal
+// once produced). Instead it binds the port and serves exactly one thing:
+// the verdict. /healthz answers 503 with durable:false and the refusal
+// reason, every other route answers 503. No store is opened and the data
+// directory is not touched, so nothing private can be read or written — the
+// refusal stays as loud as before, and is now readable, until the volume is
+// mounted properly and the deployment restarts.
+function startDegraded(reason) {
+  const server = http.createServer((req, res) => {
+    res.setHeader("x-content-type-options", "nosniff");
+    res.setHeader("content-security-policy", "default-src 'self'; frame-ancestors 'none'");
+    let p = "/";
+    try {
+      p = decodeURIComponent(new URL(req.url, "http://x").pathname);
+    } catch {
+      /* answered below */
+    }
+    const verdict = JSON.stringify({ ok: false, durable: false, reason: `not serving: ${reason}` });
+    if (req.method === "GET" && p === "/healthz") {
+      res.writeHead(503, { "content-type": "application/json", "cache-control": "no-store" });
+      return res.end(verdict);
+    }
+    res.writeHead(503, { "content-type": "application/json", "cache-control": "no-store", "retry-after": "300" });
+    res.end(verdict);
+  });
+  server.listen(PORT, () => {
+    console.error(`degraded: serving the storage refusal on ${PORT} until the persistent volume is mounted properly`);
+  });
+  const stop = () => {
+    if (server.closeAllConnections) server.closeAllConnections();
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 1000).unref();
+  };
+  process.on("SIGTERM", stop);
+  process.on("SIGINT", stop);
+  return server;
+}
+
+const resolved = resolveDataDir();
+if (resolved.refusal) {
+  console.error(`refusing to serve private data: ${resolved.refusal}`);
+  module.exports = startDegraded(resolved.refusal);
+  return;
+}
+const { dir: dataDir, durable } = resolved;
 
 // One owner per data directory: a restore run against a live server would be
 // overwritten by the server's stale in-memory state on its next save. The

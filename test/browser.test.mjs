@@ -377,6 +377,93 @@ test("a stream that opens during a channel's initial history request is recovere
   page.window.close();
 });
 
+test("a newer live event during a delayed initial history never advances the cursor past the disconnect gap", async () => {
+  // Self-contained workspace and accounts, so this runs whatever the earlier
+  // tests did to the shared one (and without touching their rate budgets).
+  const a = cookieOf((await call("POST", "/api/signup", { handle: "racer", password: "longenough1" })).res);
+  const b = cookieOf((await call("POST", "/api/signup", { handle: "racerb", password: "longenough1" })).res);
+  const rws = (await call("POST", "/api/workspaces", { name: "Race Gap" }, a)).body;
+  await call("POST", `/api/ws/${rws.slug}/channels/general/messages`, { text: "race seed" }, a);
+  const rinv = (await call("POST", "/api/invites", { slug: rws.slug }, a)).body;
+  assert.equal((await call("POST", `/api/invites/${rinv.token}/join`, null, b)).res.status, 200);
+  await call("POST", `/api/ws/${rws.slug}/channels`, { name: "late" }, a);
+  // Seeded #late history: the delayed response will derive the recovery
+  // cursor from these two rows.
+  await call("POST", `/api/ws/${rws.slug}/channels/late/messages`, { text: "late seed one" }, a);
+  await call("POST", `/api/ws/${rws.slug}/channels/late/messages`, { text: "late seed two" }, a);
+
+  const html = await (await fetch(`${base}/w/${rws.slug}`)).text();
+  const page = browser(html, { url: `${base}/w/${rws.slug}`, sid: b.split("=")[1] });
+  const doc = page.document;
+  await until(() => doc.querySelector("#log").children.length >= 1, "initial history rendered");
+  let es = FakeEventSource.last;
+
+  // The next initial-history response is captured (the server answered it)
+  // and then held: #late's history is snapshot before everything below.
+  let release;
+  const gate = new Promise((r) => (release = r));
+  let gated = false;
+  const origFetch = page.window.fetch;
+  page.window.fetch = (p, o, ...rest) => {
+    if (typeof p === "string" && /\/channels\/late\/messages\?limit=/.test(p) && !gated) {
+      gated = true;
+      return origFetch(p, o, ...rest).then((res) => gate.then(() => res));
+    }
+    return origFetch(p, o, ...rest);
+  };
+  [...doc.querySelectorAll("#channels button")].find((x) => x.textContent === "#late").click();
+  await new Promise((r) => setTimeout(r, 100));
+
+  // The two seeded #late messages are in the captured response. Now the
+  // transport dies, three messages are posted and missed, the client
+  // reconnects, and a still-newer live event arrives — all before the held
+  // response is released. The live event must NOT advance the cursor past
+  // the missed messages.
+  es.onerror();
+  const missed = [];
+  for (const text of ["gap one", "gap two", "gap three"]) {
+    missed.push((await call("POST", `/api/ws/${rws.slug}/channels/late/messages`, { text }, a)).body.message);
+  }
+  await until(() => FakeEventSource.last !== es, "reconnect scheduled during the gated history", 4000);
+  es = FakeEventSource.last;
+  es.open();
+  const liveMsg = (await call("POST", `/api/ws/${rws.slug}/channels/late/messages`, { text: "gap four" }, a)).body.message;
+  es.emit(
+    "message",
+    JSON.stringify({ type: "message", id: liveMsg.id, channel: "late", handle: "racer", text: "gap four", at: liveMsg.at })
+  );
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(
+    [...doc.querySelector("#log").children].filter((n) => n.textContent.includes("gap")).length,
+    0,
+    "nothing renders before the history does, and the live event advanced nothing"
+  );
+
+  // Release: the stale history renders first, then the owed recovery fills
+  // the whole gap from the history-derived cursor, then the buffered live
+  // event drains. Every missed message renders exactly once, in order.
+  release();
+  await until(
+    () => [...doc.querySelector("#log").children].filter((n) => n.textContent.includes("gap")).length === 4,
+    "owed recovery after the initial history",
+    4000
+  );
+  const rows = [...doc.querySelector("#log").children];
+  const ids = rows.map((n) => n.dataset.id);
+  assert.ok(rows.some((n) => n.textContent.includes("race seed")) === false, "the #general row never leaks into #late");
+  assert.deepEqual(
+    [...ids].sort((x, y) => Number(x) - Number(y)),
+    ids,
+    "history, recovered and buffered messages render in id order"
+  );
+  assert.equal(new Set(ids).size, ids.length, "no duplicates");
+  for (const text of ["gap one", "gap two", "gap three", "gap four"]) {
+    assert.equal(rows.filter((n) => n.textContent.includes(text)).length, 1, `${text} renders exactly once`);
+  }
+  page.window.fetch = origFetch;
+  page.window.close();
+});
+
 test("owner tools appear for the owner and work; non-owners never see them", async () => {
   const html = await (await fetch(`${base}/w/${slug}`)).text();
 

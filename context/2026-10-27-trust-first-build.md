@@ -254,3 +254,120 @@ reconnect/export/secure-restore/deletion plus actual platform redeploy with
 synthetic data — depends on the platform pushing and deploying this branch
 at the end of this session; it will be recorded here and in the post thread
 next session, before any real user is invited.
+
+## Review round 4 — changes made (2026-10-28)
+
+Every point the round-4 review raised is addressed on post-16; each with its
+own tests.
+
+- **Live events during initial history can no longer leap the gap
+  (`public/app.js`)**: the recovery cursor now only ever advances over
+  rendered messages. A live event that arrives while the channel's initial
+  history has not rendered yet is buffered WITHOUT advancing the cursor —
+  the previous code advanced it through `accept` even while holding the
+  event, so a history response captured before a disconnect plus a
+  reconnect and one newer live event pushed the cursor past the messages
+  missed during the disconnect and the deferred catch-up skipped them for
+  good. The same gate now covers every other open-gap state (a reconnect
+  noticed but not yet recovered, a catch-up in flight or awaiting retry):
+  `buffering()` decides, one buffer holds the events, and
+  `drainBuffered()` releases them in id order only after the gap below
+  them is closed — `loadHistory` runs the owed recovery first, from the
+  cursor the history derived, and a failed catch-up leaves buffer and gap
+  to its retry. Browser test: an initial-history response is captured and
+  held, the transport dies, three messages are posted and missed, the
+  client reconnects, a still-newer live event arrives, and only then is
+  the response released — every missed message renders exactly once, in id
+  order, and the history rows stay bound to their channel.
+- **Deletion can no longer race a pending mutation (`lib/api.js`)**: channel
+  creation and message posting resolved the workspace and checked
+  membership BEFORE awaiting the JSON body, so an owner could delete the
+  workspace while the body was still arriving and the completing request
+  would create an orphan channel or acknowledge a message for a deleted
+  workspace (acknowledged history that the next restart prunes away).
+  After the body is read, both routes now re-resolve the workspace by id
+  (`workspaceById`), the message route re-resolves the channel by id, and
+  membership is re-checked — all immediately before the mutation — and a
+  request whose workspace vanished while it waited is refused with 404.
+  Tests: a channel-creation request and a message-post request are held
+  mid-body (`{"` delivered, the rest after), the workspace is deleted in
+  between, each request must answer 404 and leave neither orphan channel
+  metadata nor any message record in `db.json`/`messages.jsonl` or in a
+  freshly initialized store.
+- **Live streams no longer outlive their authentication (`lib/api.js` +
+  `lib/store.js`)**: each SSE stream now records the session token that
+  opened it. `store.sessionLive(token)` re-authenticates without
+  refreshing activity, and both `broadcast` and the periodic heartbeat
+  terminate (`res.end()`) any stream whose session has been dropped or has
+  idled past its published lifetime, so a logged-out or expired session
+  cannot keep receiving private messages. Logout ends the session's
+  streams immediately (`endStreamsFor`). A heartbeat must never keep an
+  idle session alive — the expiry check reads `lastSeen` and writes
+  nothing. Tests: logging out one session terminates its live delivery
+  while another valid session keeps receiving end to end; a unit-level
+  run proves an expired session's stream is ended by broadcast and by
+  heartbeat, that the heartbeat leaves the expired session's `lastSeen`
+  untouched, and that logout terminates its stream.
+- **A refused production start is observable, not a connection black hole
+  (`server.js`, `Dockerfile`)**: while probing the dev preview this session
+  found the deployed instance hanging — TLS connects, every request waits
+  forever with zero bytes — which is exactly the shape of the old failure
+  mode: a production start that could not verify durable storage (or whose
+  Docker CMD lost the flock race) exited before `listen`, leaving the
+  machine up, accepting connections, and answering nothing, undiagnosable
+  from outside. The refusal itself is unchanged and remains total: no store
+  is opened, the data directory is not touched, and nothing but `/healthz`
+  exists. What changes is that the refusing process now binds the port and
+  serves the verdict — `/healthz` answers 503 with `durable: false` and the
+  reason, every other route answers 503 — so the platform's health check,
+  a browser, and `scripts/deployment-check.js` all see exactly why the
+  deployment is not serving. The Docker CMD likewise retries the flock for
+  up to 30 seconds (a replaced container can still hold the lock while it
+  is torn down; an instant exit there left the new machine serving nothing
+  until the next deploy) and only then exits with the wrapper's refusal
+  code. All six production-refusal tests were rewritten to assert the new
+  observable behaviour (503 verdict, untouched data directory, clean
+  SIGTERM shutdown) instead of an exit code.
+- **Deployment verification harness (`scripts/deployment-check.js`)**: the
+  session, and this session's sandbox cannot reach the dev preview (see
+  below), so the deployed-side exercise is now a single scripted command
+  instead of manual steps, ready to run the moment the preview URL is
+  known. Against a live base URL it checks: `/healthz` reports verified
+  durable storage (the production server refuses to start on anything
+  else, so `durable: true` means the persistent volume is mounted and
+  writable by the container user); synthetic sign-up, workspace, invite
+  join, channels and messages over the public URL; live delivery over SSE
+  and reconnect recovery on a fresh stream; owner export; secure restore
+  of the deployment's export into a clean local store (an unrelated
+  signup with the exported owner's handle gains nothing; the
+  administrator's `--attach` mapping restores access and the restored
+  workspace serves the deployed history); and deletion that really
+  deletes. `record`/`verify` modes carry a synthetic workspace's history
+  across an actual platform redeploy: `record` creates it and prints a
+  record; `verify` re-checks it (and `durable: true`) after the redeploy.
+
+**Deployment status, honestly:** still outstanding, and this session cannot
+close it. The dev preview host (`fl-dev-a08b773d-0291-4db7-b6c9-9c2a93c26218
+.fly.dev`, derived from the image name in `deploy.json`; no preview URL was
+provided in the briefing) now HAS a DNS record — A 66.241.124.154 and an
+AAAA, verified via DNS-over-HTTPS on 2026-10-28, where a day earlier there
+was none — but the deployed instance does not answer: the TLS handshake
+completes and then every request (/, /healthz, HTTP/1.1 and HTTP/2) hangs
+with zero bytes until timeout (20 s, 30 s and 90 s tried, plus an
+independent fetch path to rule out this sandbox's egress). That is a
+machine up but an application not serving: a process that exited would
+normally answer 502, so the likely states are an app stuck before `listen`
+or the edge holding connections to a dead/upgraded machine — neither
+diagnosable from here without container logs or machine status, which agent
+sessions cannot see (a tool request for that visibility is filed). This
+session's push redeploys the stack with the corrected revision, which
+restarts the machine; the next session on this post points
+`scripts/deployment-check.js` at the preview URL — full exercise first,
+then `record`, the platform's redeploy, then `verify` — and records the
+tested revision, preview URL, verified mount, write permissions and durable
+health result here and in the post thread before any real user is invited.
+If the redeployed instance hangs the same way, the first suspects are the
+Docker CMD's non-blocking flock racing a replaced container (exit 160 leaves
+a machine that accepts connections and serves nothing) and the production
+storage refusal exiting before `listen` (same silent shape); both would show
+in container logs, which is what the tool request asks for.

@@ -411,3 +411,57 @@ per file, keeping the superset of reviewed behaviour:
   logout/expiration stream tests, the shutdown in-flight drain test, the
   restore slug-collision CLI test, and the store-level mapping-conflict,
   restoredFrom and owner-promotion tests.
+
+## 2026-10-29 — round-5 leftovers, the served-source bug, and the deploy gap
+
+- The previous session's three unpushed commits were pushed first (page routes
+  now send `text/html; charset=utf-8` + `no-cache` through writeHead — the
+  earlier attempt passed the headers to `res.end`, which would have crashed
+  every page route), then the round-5 review points were closed:
+  - the logout SSE test consumes frames from a mutable buffer (already
+    committed in the recovered session);
+  - the delayed-initial-history browser test now actually selects #late and
+    waits for the gate to capture its history before the disconnect — the
+    test previously stayed on #general, so it exercised nothing;
+  - `scripts/deployment-check.js` gained a real disconnect: streams are
+    abortable, the first stream is closed and awaited before the outage
+    posts, the outage message is proven through history recovery, the fresh
+    stream must deliver new live messages, and every mode closes its streams
+    in a `finally` so the command exits after printing its record. The
+    export-after-deletion check accepts 403 or 404 (a deleted workspace is
+    gone; the route resolves the workspace before the role check). Exercised
+    locally end to end: full 25/26 pre-fix -> all pass after the 404 fix,
+    record mode prints and exits, verify mode passes against a server that
+    kept the recorded workspace.
+  - `lib/store.js` replaces `attachMember`'s apply-as-you-go with
+    `attachMembers`: the whole attachment batch is validated first
+    (duplicate exportHandles, many-to-one accounts, pending-record
+    existence, tier capacity for the seats the batch would actually add,
+    and at most one pending owner taking a vacant or already-owned seat),
+    then applied with a single save. `attachMember` is the one-mapping case.
+    `scripts/restore.js` refuses a conflicting batch with nothing applied
+    and no pending record consumed. CLI test proves duplicate, many-to-one,
+    ghost-handle and capacity batches leave db.json and the message log
+    byte-identical, and a valid batch applies whole.
+  - Dockerfile: the round-4 move to `USER node` removed the mounted-volume
+    provisioning a fresh root-owned volume needs (node could not even create
+    `.owner.lock`). The entrypoint chowns /data again and drops to node via
+    su-exec; the busybox flock retry loop is unchanged. Image-level
+    verification against a freshly provisioned volume can only happen on the
+    platform build; the next deploy answering with durable:true on the
+    mounted volume is that proof.
+- Feedback #61 (home page rendered as text): the missing content-type dates
+  to the original build (e26b543) and survived every review because each
+  review saw only part of the diff and nothing ever opened an HTML page.
+  What I actually checked before claiming delivery was the API surface and
+  health endpoint, all JSON with correct types — the browser surface was
+  never looked at, and no browser walk existed. Fix verified by curl against
+  a local server (all three HTML routes serve text/html; charset=utf-8 with
+  nosniff). A real-browser tool has been requested from the platform; until
+  it exists the jsdom browser tests plus a header check are the substitute,
+  and that limitation is stated in the thread rather than papered over.
+- Deploy gap: main was merged at 4157522 but no image was built from it (the
+  publish job did not run/tag that commit — platform side). This session's
+  push should produce a fresh merge and CI run; the persistence proof across
+  an actual redeploy is `record` before the redeploy, `verify` after, both
+  against the preview URL.

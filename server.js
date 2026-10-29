@@ -182,16 +182,24 @@ const server = http.createServer(async (req, res) => {
       return res.end(body);
     }
 
+    // The page routes send HTML: without an explicit content-type, nosniff
+    // would make the browser render the document as plain text.
+    // res.end takes (chunk, encoding, callback); headers must go through
+    // writeHead first or the response never completes.
+    const sendPage = (html) => {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" });
+      res.end(html);
+    };
     if (pathname === "/" || pathname === "/index.html") {
-      return res.end(pages.home());
+      return sendPage(pages.home());
     }
     let m = pathname.match(/^\/join\/([A-Za-z0-9_-]+)$/);
     if (m) {
-      return res.end(pages.join(m[1]));
+      return sendPage(pages.join(m[1]));
     }
     m = pathname.match(/^\/w\/([a-z0-9-]+)$/);
     if (m) {
-      return res.end(pages.chat(m[1]));
+      return sendPage(pages.chat(m[1]));
     }
 
     sendJson(res, 404, { error: "Not found." });

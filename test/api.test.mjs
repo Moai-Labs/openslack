@@ -337,6 +337,101 @@ test("the restore command never mistakes an unrelated workspace for a restore of
   fs.rmSync(expFile, { force: true });
 });
 
+test("a refused attachment batch leaves the restored workspace's metadata and pending records untouched", async () => {
+  const { Store } = await import("../lib/store.js");
+  const LIMITS = (await import("../lib/limits.js")).default;
+  const runRestore = (dataDir, args) => {
+    try {
+      return {
+        code: 0,
+        out: execFileSync(process.execPath, [path.join(ROOT_SERVER, "scripts", "restore.js"), ...args], {
+          env: { ...process.env, DATA_DIR: dataDir },
+          encoding: "utf8",
+          timeout: 20000
+        })
+      };
+    } catch (err) {
+      return { code: err.status, out: String(err.stdout || ""), err: String(err.stderr || err.message) };
+    }
+  };
+  const expFile = path.join(os.tmpdir(), `openslack-batch-export-${process.pid}.json`);
+  fs.writeFileSync(expFile, JSON.stringify({
+    format: "openslack-export-v1",
+    exportedAt: "2026-10-27T12:00:00.000Z",
+    workspace: { slug: "batched", name: "Batched", ownerId: "u1", createdAt: "2026-10-01T00:00:00.000Z" },
+    members: [
+      { handle: "alice", role: "owner", joinedAt: null },
+      { handle: "bob", role: "member", joinedAt: null },
+      { handle: "carol", role: "member", joinedAt: null }
+    ],
+    channels: [{ name: "general", topic: "", createdAt: "2026-10-01T00:00:00.000Z" }],
+    messages: [{ id: "1", channel: "general", handle: "alice", text: "kept", at: "2026-10-02T00:00:00.000Z" }]
+  }));
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openslack-restore-batch-"));
+  const first = runRestore(dir, [expFile]);
+  assert.equal(first.code, 0, first.err && first.err.slice(0, 200));
+  const snap = () => fs.readFileSync(path.join(dir, "db.json"), "utf8");
+  const logSnap = () => fs.readFileSync(path.join(dir, "messages.jsonl"), "utf8");
+  const before = snap();
+  const logBefore = logSnap();
+
+  // The verified accounts exist; every conflicting batch below must be
+  // refused whole, with the store byte-identical afterwards.
+  const s = new Store(dir).init();
+  const rea = s.createUser("rea", "longenough1");
+  const reb = s.createUser("reb", "longenough1");
+  s.saveDb();
+  const afterUsers = snap(); // only the new accounts may differ
+
+  const dup = runRestore(dir, [expFile, "--attach", "alice=rea", "--attach", "alice=reb"]);
+  assert.equal(dup.code, 1, "a duplicate exportHandle is refused");
+  assert.match(dup.err, /mapped more than once/);
+  assert.equal(snap(), afterUsers, "the refused duplicate batch changed no workspace state");
+  assert.equal(logSnap(), logBefore);
+
+  const many = runRestore(dir, [expFile, "--attach", "alice=rea", "--attach", "bob=rea"]);
+  assert.equal(many.code, 1, "two handles on one account are refused");
+  assert.match(many.err, /more than one exported handle/);
+  assert.equal(snap(), afterUsers, "the refused many-to-one batch changed no workspace state");
+  assert.equal(logSnap(), logBefore);
+
+  const ghost = runRestore(dir, [expFile, "--attach", "ghost=rea"]);
+  assert.equal(ghost.code, 1, "a handle with no pending record is refused");
+  assert.match(ghost.err, /No pending member/);
+  assert.equal(snap(), afterUsers, "the refused ghost batch changed no workspace state");
+  assert.equal(logSnap(), logBefore);
+
+  // Capacity: fill every free seat, then a two-seat batch cannot fit.
+  const s2 = new Store(dir).init();
+  const ws2 = s2.workspaceBySlug("batched");
+  for (let i = 0; i < LIMITS.FREE_MAX_MEMBERS; i++) s2.joinWorkspace(ws2, s2.createUser(`seat${i}`, "longenough1"));
+  s2.saveDb();
+  const afterFill = snap();
+  const full = runRestore(dir, [expFile, "--attach", "alice=rea", "--attach", "bob=reb"]);
+  assert.equal(full.code, 1, "a batch that does not fit the tier is refused");
+  assert.match(full.err, /does not fit/);
+  assert.equal(snap(), afterFill, "the refused capacity batch changed no workspace state");
+  assert.equal(logSnap(), logBefore);
+
+  // A valid batch applies whole: both pending records consumed, both
+  // members added, one save. Seats are freed first — the capacity fill
+  // above is still in place.
+  const s2b = new Store(dir).init();
+  const ws2b = s2b.workspaceBySlug("batched");
+  s2b.db.members = s2b.db.members.filter((m) => m.wsId !== ws2b.id);
+  s2b.saveDb();
+  const ok = runRestore(dir, [expFile, "--attach", "carol=rea", "--attach", "alice=reb"]);
+  assert.equal(ok.code, 0, ok.err && ok.err.slice(0, 200));
+  assert.match(ok.out, /attached:/);
+  const s3 = new Store(dir).init();
+  const ws3 = s3.workspaceBySlug("batched");
+  assert.deepEqual((ws3.pendingMembers || []).map((p) => p.handle), ["bob"], "only the unmapped handle stays pending");
+  const rebId = s3.db.users.find((u) => u.handle === "reb").id;
+  assert.equal(s3.membership(ws3.id, rebId).role, "owner", "the attached pending owner takes the vacant owner seat");
+  fs.rmSync(expFile, { force: true });
+});
+
 // A stream is only as authenticated as the session that opened it.
 const until = async (fn, what, timeoutMs = 3000) => {
   const start = Date.now();
@@ -380,11 +475,12 @@ test("logging out ends a stream's live delivery; another session keeps receiving
             state.ended = true;
             return;
           }
-          const buf = (state._buf = (state._buf || "") + dec.decode(value, { stream: true }));
+          let buf = (state._buf = (state._buf || "") + dec.decode(value, { stream: true }));
           let i;
           while ((i = buf.indexOf("\n\n")) >= 0) {
             const chunk = buf.slice(0, i);
-            state._buf = buf.slice(i + 2);
+            buf = buf.slice(i + 2);
+            state._buf = buf;
             if (chunk.startsWith("event: message")) state.events.push(JSON.parse(chunk.split("data: ")[1]));
           }
           state._reader = reader;

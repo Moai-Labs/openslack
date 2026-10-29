@@ -132,7 +132,17 @@ function main() {
       console.error("nothing to attach: give --attach exportHandle=storeAccount mappings.");
       process.exit(1);
     }
-    for (const a of attach) store.attachMember(ws, a.exportHandle, store.db.users.find((u) => u.id === a.userId));
+    // The whole batch is validated before anything is applied: a duplicate
+    // handle, a many-to-one account, a missing pending record, a seat that
+    // does not fit or a second owner must refuse the batch whole, leaving
+    // the workspace's metadata and pending memberships untouched.
+    try {
+      store.attachMembers(ws, attach);
+    } catch (err) {
+      console.error(err.message);
+      console.error("The attachment batch was refused: nothing was attached and no pending record was consumed.");
+      process.exit(1);
+    }
   }
   const messages = store.messages.filter((m) => m.wsId === ws.id).length;
   const pending = ws.pendingMembers || [];

@@ -663,6 +663,15 @@ test("a newer live event during a delayed initial history never advances the cur
   });
   const doc = page.document;
   await until(() => doc.querySelector("#log").children.length >= 1, "initial history rendered");
+
+  // The page opens on #general; the gate only captures the #late history
+  // request, and the recovery rules under test apply to the channel the
+  // client is actually on. Select #late and wait until the gate holds its
+  // initial history response before anything else happens.
+  const lateBtn = [...doc.querySelectorAll("#channels button")].find((b) => b.textContent === "#late");
+  assert.ok(lateBtn, "the #late channel button is rendered");
+  lateBtn.onclick();
+  await until(() => gated, "the gated #late history request has been captured", 4000);
   let es = FakeEventSource.last;
 
   // The two seeded #late messages are in the captured response. Now the

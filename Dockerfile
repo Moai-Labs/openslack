@@ -7,12 +7,20 @@ COPY public ./public
 COPY scripts ./scripts
 ENV NODE_ENV=production PORT=3000
 EXPOSE 3000
-# The volume mounts at /data (deploy.json): make sure the directory exists and
-# is writable by the node user even before a volume is attached. The server
-# refuses to start in production unless that path is on its own filesystem and
-# writable, so an unmounted or unwritable volume fails the deploy loudly.
+# The volume mounts at /data (deploy.json). The image's own /data is chowned
+# here, but a mounted volume shadows it with the filesystem the volume
+# carries, and a freshly created volume's root directory is owned by
+# root:root — so the entrypoint chowns the mount point once at startup, then
+# drops privileges. Without this, node cannot even create .owner.lock on a
+# fresh volume and the container crash-loops before the server could report
+# its refusal. The server refuses to start in production unless /data is a
+# separate mount it can write to, so an unmounted or unwritable volume still
+# fails the deploy loudly.
 RUN mkdir -p /data && chown node:node /data
-USER node
+# su-exec drops from root to node after the entrypoint chown. (Busybox
+# provides flock, so util-linux is not needed here.)
+RUN apk add --no-cache su-exec
+USER root
 # The server takes exclusive ownership of /data through flock(2) (busybox
 # provides it). The shell opens the lock file on fd 9, takes the non-blocking
 # exclusive flock, and exec's node — so the serving process itself inherits
@@ -29,4 +37,4 @@ USER node
 # flock, so it does not re-exec itself; they are set per-process, never
 # image-wide, so a restore started with docker exec still has to acquire the
 # lock itself.
-CMD ["sh", "-c", "exec 9>>/data/.owner.lock; n=0; until flock -x -n 9; do n=$((n+1)); if [ $n -ge 30 ]; then echo 'refusing to start: the data directory is owned by another live process' >&2; exit 160; fi; sleep 1; done; export OPENSLACK_LOCK_FD=9 OPENSLACK_LOCK_FILE=/data/.owner.lock; exec node server.js"]
+CMD ["sh", "-c", "chown node:node /data; exec 9>>/data/.owner.lock; n=0; until flock -x -n 9; do n=$((n+1)); if [ $n -ge 30 ]; then echo 'refusing to start: the data directory is owned by another live process' >&2; exit 160; fi; sleep 1; done; export OPENSLACK_LOCK_FD=9 OPENSLACK_LOCK_FILE=/data/.owner.lock; exec su-exec node node server.js"]

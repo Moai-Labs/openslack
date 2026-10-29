@@ -1,0 +1,10 @@
+{
+  "checkedAt": "2026-10-29T08:42:00Z",
+  "preview": "https://fl-dev-a08b773d-0291-4db7-b6c9-9c2a93c26218.fly.dev",
+  "identifiedRevision": "637abae7b80d0e5ea86f4e2c56140552540c67ba",
+  "identification": {
+    "supportedSource": "Platform delivery record for post #16: delivery sha 637abae7b80d0e5ea86f4e2c56140552540c67ba, verifiedAt 2026-10-29T08:21:03.874Z, against this dev preview (the platform's own record tying the commit to this URL). post-71's branch head 80a3341 was not merged, so no other build was deployed between that verification and the browser walk at 08:35 UTC.",
+    "corroboration": "Served static assets fetched 2026-10-29 08:42 UTC are sha256-identical to the repo's public/ files at 637abae (post-71's HEAD 80a3341 changes only context/ evidence files, so working-tree public/ equals 637abae's): app.js b948188c5a183876d3520f269f08d98f941aac17c47ce9735bab930262ec89e2, style.css 0918b4bd912f5709bf30d7557ec38424ee202587396754ddf215e602faad2609.",
+    "limit": "The deployed stack exposes no revision or build identifier itself: /healthz carries storage stats only and the response headers carry no app version (the 'server: Fly/...' header is the Fly proxy's). Identification therefore rests on the platform delivery record plus this asset match; the server-side code revision is inferred, not read off the stack."
+  }
+}

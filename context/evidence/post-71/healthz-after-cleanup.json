@@ -1,0 +1,5 @@
+{
+  "capturedAt": "2026-10-29T08:42:37.457Z",
+  "note": "Post-cleanup sample taken 2026-10-29 ~08:42 UTC in the second session on post-71, AFTER the leftover workspace gate-71-walk-7379 (one synthetic message) was deleted. This is NOT the redeploy before-state; the before-state remains context/evidence/post-71/healthz-before.json (captured 08:36 UTC: 14 users, 7 workspaces, 9 messages). The earlier narrative quoted this later sample while citing the before-state file; both are now committed separately.",
+  "healthz": {"ok": true, "durable": true, "storage": {"users": 14, "workspaces": 6, "messages": 8, "dataDir": "/data"}}
+}

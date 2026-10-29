@@ -1,0 +1,111 @@
+{
+  "base": "https://fl-dev-a08b773d-0291-4db7-b6c9-9c2a93c26218.fly.dev",
+  "at": "2026-10-29T08:35:52.318Z",
+  "results": [
+    {
+      "n": 1,
+      "name": "Logged-out access",
+      "at": "2026-10-29T08:35:44.305Z",
+      "status": "PASS",
+      "detail": "h1=\"OpenSlack\", sign-in tab visible=true; rendered body starts: \" OpenSlackPrivate team chat. Five members free. Sign in Create account Handle \""
+    },
+    {
+      "n": 2,
+      "name": "Sign-up",
+      "at": "2026-10-29T08:35:44.685Z",
+      "status": "PASS",
+      "detail": "dashboard greeting: \"@pw71-geosowner\""
+    },
+    {
+      "n": 3,
+      "name": "Login after logout",
+      "at": "2026-10-29T08:35:45.092Z",
+      "status": "PASS",
+      "detail": "greeting after sign-in: \"@pw71-geosowner\""
+    },
+    {
+      "n": 4,
+      "name": "Create workspace + open chat",
+      "at": "2026-10-29T08:35:45.382Z",
+      "status": "PASS",
+      "detail": "slug=gate-71-walk-1ed4, SSE connection badge shows connected"
+    },
+    {
+      "n": 5,
+      "name": "Owner posts message",
+      "at": "2026-10-29T08:35:45.532Z",
+      "status": "PASS",
+      "detail": "message rendered in log: true"
+    },
+    {
+      "n": 6,
+      "name": "Create ordinary invitation link",
+      "at": "2026-10-29T08:35:45.641Z",
+      "status": "PASS",
+      "detail": "invite url: https://fl-dev-a08b773d-0291-4db7-b6c9-9c2a93c26218.fly.dev/join/EUH5cJ_hdGrFdf68"
+    },
+    {
+      "n": 7,
+      "name": "Second account sign-up",
+      "at": "2026-10-29T08:35:46.585Z",
+      "status": "PASS",
+      "detail": "dashboard greeting: \"@pw71-geosmember\""
+    },
+    {
+      "n": 8,
+      "name": "Member joins via invitation",
+      "at": "2026-10-29T08:35:47.581Z",
+      "status": "PASS",
+      "detail": "join page: \"\"; member chat open, connected"
+    },
+    {
+      "n": 9,
+      "name": "Live message member→owner (SSE, no reload)",
+      "at": "2026-10-29T08:35:47.724Z",
+      "status": "PASS",
+      "detail": "owner saw \"gate71 member live message 2026-10-29T08…\" appear without reload"
+    },
+    {
+      "n": 10,
+      "name": "Live message owner→member (SSE, no reload)",
+      "at": "2026-10-29T08:35:47.857Z",
+      "status": "PASS",
+      "detail": "member saw \"gate71 owner live reply 2026-10-29T08:35…\" appear without reload"
+    },
+    {
+      "n": 11,
+      "name": "Reconnect + history after reload",
+      "at": "2026-10-29T08:35:48.565Z",
+      "status": "PASS",
+      "detail": "after full reload both accounts' messages still in log (msg1=true, msg2=true, msg3=true)"
+    },
+    {
+      "n": 12,
+      "name": "Workspace search",
+      "at": "2026-10-29T08:35:48.708Z",
+      "status": "PASS",
+      "detail": "search info: \"3 matches for “gate71” across all channels (newest first)\"; hits rendered in log"
+    },
+    {
+      "n": 13,
+      "name": "Owner export",
+      "at": "2026-10-29T08:35:48.876Z",
+      "status": "PASS",
+      "detail": "downloaded via /api/ws/gate-71-walk-1ed4/export; export slug=gate-71-walk-1ed4, top-level keys=format,exportedAt,workspace,members,pendingMembers,channels,messages, messages≥3=true"
+    },
+    {
+      "n": 14,
+      "name": "Owner deletion",
+      "at": "2026-10-29T08:35:49.813Z",
+      "status": "PASS",
+      "detail": "owner returned to dashboard; member view after delete starts: \" + Members Invite link Pay $12 — test-USDC Export history Delete workspace Transaction hash Verify and activate Cancel connecting… Search Back to channel No suc\""
+    },
+    {
+      "n": 15,
+      "name": "Redeploy marker seeded (left in place)",
+      "at": "2026-10-29T08:35:52.241Z",
+      "status": "PASS",
+      "detail": "ws slug=gate71-redeploy-marker, 3 dated messages, ids=10,11,12"
+    }
+  ]
+}

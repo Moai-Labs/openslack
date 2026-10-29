@@ -64,14 +64,19 @@ async function signup(base, handle, password) {
 }
 
 // Subscribe to a workspace's SSE stream and record message events; resolve
-// `ended` when the server closes the stream.
+// `ended` when the server closes the stream or the stream is aborted. The
+// abort is the disconnect: the caller drops the stream the way a dying
+// transport would, and awaits `ended` before calling the outage real.
 function openStream(base, path, cookie) {
-  const state = { events: [], ended: false, error: null };
+  const state = { events: [], ended: false, error: null, open: false };
+  const controller = new AbortController();
+  state.close = () => controller.abort();
   state.ready = (async () => {
-    const res = await fetch(`${base}${path}`, { headers: { cookie } });
+    const res = await fetch(`${base}${path}`, { headers: { cookie }, signal: controller.signal });
     if (!res.ok || res.headers.get("content-type") !== "text/event-stream") {
       throw new Error(`stream did not open (${res.status})`);
     }
+    state.open = true;
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
@@ -94,6 +99,24 @@ function openStream(base, path, cookie) {
     state.ended = true;
   });
   return state;
+}
+
+// Disconnect a stream the way the transport would and wait until the reader
+// has actually finished, so messages posted afterwards are genuinely missed
+// by it and the check cannot pass off a still-open stream as a reconnect.
+async function dropStream(state, name) {
+  if (!state || state.ended) return;
+  state.close();
+  await Promise.race([state.ready, sleep(3000)]);
+  check(`${name} stream is really disconnected before the outage`, state.ended === true, state.error ? String(state.error.message) : "");
+}
+
+// Close whatever streams a run still holds, whatever happened.
+function closeStreams(built) {
+  if (!built || !built.streams) return;
+  for (const s of built.streams) {
+    try { if (!s.ended) s.close(); } catch {}
+  }
 }
 
 const saw = (state, text) => state.events.some((e) => e.type === "message" && e.text === text);
@@ -221,8 +244,10 @@ async function buildSyntheticWorkspace(base, tag) {
   }
   check("three synthetic messages posted", true);
 
-  // Live delivery, then a dropped connection and a fresh stream: the new
-  // stream must deliver a message posted after the drop (reconnect proof).
+  // Live delivery, then a genuine disconnect: the first stream is aborted
+  // and awaited, a message is posted while nothing is attached, and a fresh
+  // stream must both deliver new live messages and leave the missed one
+  // recoverable through history.
   const stream = openStream(base, `/api/ws/${ws.body.slug}/stream`, guest.cookie);
   await sleep(500);
   const live = await call(base, "POST", `/api/ws/${ws.body.slug}/channels/general/messages`, { text: "Delta: live one" }, owner.cookie);
@@ -234,32 +259,46 @@ async function buildSyntheticWorkspace(base, tag) {
   }
   check("live delivery over the deployed SSE stream", ok);
 
+  await dropStream(stream, "the first"); // the outage begins here
+  const missed = await call(base, "POST", `/api/ws/${ws.body.slug}/channels/general/messages`, { text: "Echo: posted during the outage" }, owner.cookie);
+  check("the outage message posts with no stream attached", missed.status === 201);
+
   const stream2 = openStream(base, `/api/ws/${ws.body.slug}/stream`, guest.cookie); // fresh stream = the reconnect
   await sleep(500);
-  await call(base, "POST", `/api/ws/${ws.body.slug}/channels/general/messages`, { text: "Echo: after reconnect" }, owner.cookie);
+  const after = await call(base, "POST", `/api/ws/${ws.body.slug}/channels/general/messages`, { text: "Foxtrot: live after the reconnect" }, owner.cookie);
+  check("a message posts after the reconnect", after.status === 201);
   ok = false;
   for (let i = 0; i < 40 && !ok; i++) {
-    ok = saw(stream2, "Echo: after reconnect");
+    ok = saw(stream2, "Foxtrot: live after the reconnect");
     if (!ok) await sleep(100);
   }
-  check("a fresh stream (reconnect) delivers new messages", ok);
+  check("the fresh stream delivers live messages after the reconnect", ok);
 
   const hist = await call(base, "GET", `/api/ws/${ws.body.slug}/channels/general/messages?limit=100`, null, guest.cookie);
   const got = (hist.body.messages || []).map((m) => m.text);
-  check("history over a fresh connection holds every synthetic message", texts.every((t) => got.includes(t)) && got.includes("Delta: live one") && got.includes("Echo: after reconnect"), `${got.length} messages`);
+  check(
+    "history holds every synthetic message, the outage one included",
+    texts.every((t) => got.includes(t)) && got.includes("Delta: live one") && got.includes("Echo: posted during the outage") && got.includes("Foxtrot: live after the reconnect"),
+    `${got.length} messages`
+  );
 
   const exp = await fetch(`${base}/api/ws/${ws.body.slug}/export`, { headers: { cookie: owner.cookie } });
   const exportBody = await exp.text();
-  check("the owner can export the workspace", exp.status === 200 && JSON.parse(exportBody).messages.length >= 4, `${JSON.parse(exportBody).messages.length} exported messages`);
+  check("the owner can export the workspace", exp.status === 200 && JSON.parse(exportBody).messages.length >= 6, `${JSON.parse(exportBody).messages.length} exported messages`);
 
-  return { ws: ws.body, owner, guest, texts, exportBody, tag };
+  // Returned so every mode can close the streams in a finally block: an
+  // attached stream keeps the process alive after the result is printed.
+  return { ws: ws.body, owner, guest, texts, exportBody, tag, streams: [stream, stream2] };
 }
 
 async function deleteSyntheticWorkspace(base, built) {
   const del = await call(base, "DELETE", `/api/ws/${built.ws.slug}`, null, built.owner.cookie);
   check("the owner deletes the synthetic workspace", del.status === 200);
   check("its history is gone for good", (await call(base, "GET", `/api/ws/${built.ws.slug}/channels/general/messages?limit=100`, null, built.owner.cookie)).status === 404);
-  check("its export is gone", (await fetch(`${base}/api/ws/${built.ws.slug}/export`, { headers: { cookie: built.owner.cookie } })).status === 403);
+  // A deleted workspace is gone: its export is refused (403) or the
+  // workspace is simply not found (404) — anything but a served export.
+  const gone = await fetch(`${base}/api/ws/${built.ws.slug}/export`, { headers: { cookie: built.owner.cookie } });
+  check("its export is gone", gone.status === 403 || gone.status === 404, `status ${gone.status}`);
 }
 
 async function main() {
@@ -296,21 +335,28 @@ async function main() {
   }
 
   const tag = String(Date.now() % 10000000);
-  const built = await buildSyntheticWorkspace(base, tag);
+  let built = null;
+  try {
+    built = await buildSyntheticWorkspace(base, tag);
 
-  if (mode === "record") {
-    // Leave the workspace in place; its record is the input to `verify` after
-    // the platform's next redeploy of the same deployment.
-    console.log("RECORD " + JSON.stringify({
-      slug: built.ws.slug,
-      handle: `synth-${tag}-a`,
-      password: "synthetic password 1",
-      texts: built.texts,
-      recordedAt: new Date().toISOString()
-    }));
-  } else {
-    await runLocalRestorePhase(built.exportBody, tag);
-    await deleteSyntheticWorkspace(base, built);
+    if (mode === "record") {
+      // Leave the workspace in place; its record is the input to `verify` after
+      // the platform's next redeploy of the same deployment.
+      console.log("RECORD " + JSON.stringify({
+        slug: built.ws.slug,
+        handle: `synth-${tag}-a`,
+        password: "synthetic password 1",
+        texts: built.texts,
+        recordedAt: new Date().toISOString()
+      }));
+    } else {
+      await runLocalRestorePhase(built.exportBody, tag);
+      await deleteSyntheticWorkspace(base, built);
+    }
+  } finally {
+    // Every mode closes its streams, including a crashed check: an attached
+    // stream would otherwise keep the process alive after the result printed.
+    closeStreams(built);
   }
 
   console.log(`\n${process.exitCode ? "FAILED" : "ALL PASS"} — ${passed} checks passed`);

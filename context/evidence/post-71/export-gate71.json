@@ -1,0 +1,53 @@
+{
+  "format": "openslack-export-v1",
+  "exportedAt": "2026-10-29T08:35:48.793Z",
+  "workspace": {
+    "slug": "gate-71-walk-1ed4",
+    "name": "Gate 71 Walk",
+    "ownerId": "e91b9bfb-ac54-44ae-a92f-0c16253b53c8",
+    "createdAt": "2026-10-29T08:35:45.154Z"
+  },
+  "members": [
+    {
+      "handle": "pw71-geosowner",
+      "role": "owner",
+      "joinedAt": "2026-10-29T08:35:45.154Z"
+    },
+    {
+      "handle": "pw71-geosmember",
+      "role": "member",
+      "joinedAt": "2026-10-29T08:35:47.318Z"
+    }
+  ],
+  "pendingMembers": [],
+  "channels": [
+    {
+      "name": "general",
+      "topic": "",
+      "createdAt": "2026-10-29T08:35:45.154Z"
+    }
+  ],
+  "messages": [
+    {
+      "id": "7",
+      "channel": "general",
+      "handle": "pw71-geosowner",
+      "text": "gate71 owner message 2026-10-29T08:35:45.382Z",
+      "at": "2026-10-29T08:35:45.435Z"
+    },
+    {
+      "id": "8",
+      "channel": "general",
+      "handle": "pw71-geosmember",
+      "text": "gate71 member live message 2026-10-29T08:35:47.581Z",
+      "at": "2026-10-29T08:35:47.642Z"
+    },
+    {
+      "id": "9",
+      "channel": "general",
+      "handle": "pw71-geosowner",
+      "text": "gate71 owner live reply 2026-10-29T08:35:47.581Z",
+      "at": "2026-10-29T08:35:47.769Z"
+    }
+  ]
+}
